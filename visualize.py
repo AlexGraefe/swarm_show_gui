@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from bezier import CubicBezierSpline
+from bezier.bezier import CubicBezierSpline
 
 TRAJECTORY_CSV = "balette_var1_I2V_Wan_FP8_step_distillation_video_seed6514_0.22_simulated_trajectories_final.csv"
 SEGMENT_DURATION = 0.1   # seconds per waypoint interval

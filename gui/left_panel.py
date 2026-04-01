@@ -23,6 +23,9 @@ from PyQt6.QtWidgets import (
 
 class LeftPanel(QFrame):
     simulate_requested = pyqtSignal()
+    connect_requested = pyqtSignal(str, int)
+    disconnect_requested = pyqtSignal()
+    fly_requested = pyqtSignal()
 
     class PanelState(Enum):
         LOAD_CSV = auto()
@@ -76,17 +79,23 @@ class LeftPanel(QFrame):
         self._dt_start_input = QLineEdit()
         self._dt_show_input = QLineEdit()
         self._num_trials_input = QLineEdit()
+        self._base_address_input = QLineEdit()
+        self._num_drones_input = QLineEdit()
         self._last_valid_dt_start = "0.1"
         self._last_valid_dt_show = "0.1"
         self._last_valid_num_trials = "1"
+        self._last_valid_num_drones = "1"
         self._dt_start_input.setText(self._last_valid_dt_start)
         self._dt_show_input.setText(self._last_valid_dt_show)
         self._num_trials_input.setText(self._last_valid_num_trials)
+        self._base_address_input.setText("radio://0/75/2M/DB1F1010")
+        self._num_drones_input.setText(self._last_valid_num_drones)
 
         for number_input in (
             self._dt_start_input,
             self._dt_show_input,
             self._num_trials_input,
+            self._num_drones_input,
         ):
             number_input.setPlaceholderText("0")
 
@@ -108,13 +117,19 @@ class LeftPanel(QFrame):
                 "_last_valid_num_trials",
             )
         )
+        self._num_drones_input.returnPressed.connect(
+            lambda: self._validate_and_commit_int(
+                self._num_drones_input,
+                "_last_valid_num_drones",
+            )
+        )
 
-        config_layout = QFormLayout()
-        config_layout.setSpacing(8)
-        config_layout.addRow("Dt start", self._dt_start_input)
-        config_layout.addRow("Dt show", self._dt_show_input)
-        config_layout.addRow("Number Trials", self._num_trials_input)
-        layout.addLayout(config_layout)
+        show_config_layout = QFormLayout()
+        show_config_layout.setSpacing(8)
+        show_config_layout.addRow("Dt start", self._dt_start_input)
+        show_config_layout.addRow("Dt show", self._dt_show_input)
+        show_config_layout.addRow("Number Trials", self._num_trials_input)
+        layout.addLayout(show_config_layout)
 
         self._save_config_btn = QPushButton("Save Config")
         self._save_config_btn.clicked.connect(self._save_config)
@@ -123,6 +138,25 @@ class LeftPanel(QFrame):
         self._simulate_btn = QPushButton("Simulate")
         self._simulate_btn.clicked.connect(self.simulate_requested.emit)
         layout.addWidget(self._simulate_btn)
+
+        connection_layout = QFormLayout()
+        connection_layout.setSpacing(8)
+        connection_layout.addRow("Base Address", self._base_address_input)
+        connection_layout.addRow("Number Drones", self._num_drones_input)
+        layout.addLayout(connection_layout)
+
+        self._connect_btn = QPushButton("Connect")
+        self._connect_btn.clicked.connect(self._on_connect_clicked)
+        layout.addWidget(self._connect_btn)
+
+        self._fly_btn = QPushButton("Fly")
+        self._fly_btn.clicked.connect(self.fly_requested.emit)
+        self._fly_btn.setEnabled(False)
+        layout.addWidget(self._fly_btn)
+
+        self._disconnect_btn = QPushButton("Disconnect")
+        self._disconnect_btn.clicked.connect(self.disconnect_requested.emit)
+        layout.addWidget(self._disconnect_btn)
 
         self._apply_state_ui()
 
@@ -159,8 +193,20 @@ class LeftPanel(QFrame):
             self._dt_start_input,
             self._dt_show_input,
             self._num_trials_input,
+            self._base_address_input,
+            self._num_drones_input,
         ):
             number_input.setEnabled(enabled)
+
+        self._save_config_btn.setEnabled(enabled)
+        self._simulate_btn.setEnabled(enabled)
+        self._connect_btn.setEnabled(enabled)
+        self._disconnect_btn.setEnabled(enabled)
+        if not enabled:
+            self._fly_btn.setEnabled(False)
+
+    def set_fly_enabled(self, enabled: bool) -> None:
+        self._fly_btn.setEnabled(enabled)
 
     def _apply_state_ui(self) -> None:
         if self._state == self.PanelState.LOAD_CSV:
@@ -295,6 +341,19 @@ class LeftPanel(QFrame):
             f"Configuration saved to {config_path.name}.",
         )
 
+    def _on_connect_clicked(self) -> None:
+        base_address = self.get_base_address()
+        if not base_address:
+            QMessageBox.warning(self, "Invalid Base Address", "Base address cannot be empty.")
+            return
+
+        num_drones = self.get_num_drones()
+        if num_drones <= 0:
+            QMessageBox.warning(self, "Invalid Drone Count", "Number of drones must be positive.")
+            return
+
+        self.connect_requested.emit(base_address, num_drones)
+
     @staticmethod
     def _csv_header_has_xyz_groups(columns: list[str]) -> bool:
         pattern = re.compile(r"^([xyz])(\d+)$")
@@ -420,3 +479,22 @@ class LeftPanel(QFrame):
         self._last_valid_num_trials = str(value)
         self._num_trials_input.setText(self._last_valid_num_trials)
         return value
+
+    def get_base_address(self) -> str:
+        return self._base_address_input.text().strip()
+
+    def get_num_drones(self) -> int:
+        text = self._num_drones_input.text().strip()
+        if not text:
+            text = self._last_valid_num_drones or "1"
+
+        fallback = self._last_valid_num_drones or "1"
+        if not text.isdigit() or int(text) <= 0:
+            value = int(fallback)
+        else:
+            value = int(text)
+
+        self._last_valid_num_drones = str(value)
+        self._num_drones_input.setText(self._last_valid_num_drones)
+        return value
+

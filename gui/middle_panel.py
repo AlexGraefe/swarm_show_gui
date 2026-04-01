@@ -18,6 +18,13 @@ from bezier.bezier import CubicBezierSpline
 DEFAULT_SEGMENT_DURATION = 0.1
 POINTS_PER_SEGMENT = 10
 HOVER_SECONDS = 5.0
+STITCH_POINT_REPEAT = 10
+TESTBED_X_MIN = -4.0
+TESTBED_X_MAX = 4.0
+TESTBED_Y_MIN = -4.0
+TESTBED_Y_MAX = 4.0
+TESTBED_Z_MIN = 0.0
+TESTBED_Z_MAX = 3.0
 
 
 def interpolate_trajectory(
@@ -66,9 +73,192 @@ class MiddlePanel(QFrame):
 		self._all_zi: list[np.ndarray] = []
 		self._trails = []
 		self._markers = []
+		self._target_markers = []
 		self._trail_len = POINTS_PER_SEGMENT * 3
+		self._mode = "simulation"
+		self._phase_xi: list[np.ndarray] = []
+		self._phase_yi: list[np.ndarray] = []
+		self._phase_zi: list[np.ndarray] = []
+		self._phase_durations: list[float] = []
+		self._phase_start_time: float | None = None
+		self._current_phase_name = ""
 
 		self._show_message("Select a valid folder and click Simulate")
+
+	def start_live_mode(self, n_drones: int) -> None:
+		"""Switch panel to live measured-position rendering mode."""
+		self._timer.stop()
+		self._mode = "live"
+		self._n_drones = n_drones
+		self._all_xi = [np.array([], dtype=float) for _ in range(n_drones)]
+		self._all_yi = [np.array([], dtype=float) for _ in range(n_drones)]
+		self._all_zi = [np.array([], dtype=float) for _ in range(n_drones)]
+		self._phase_xi = []
+		self._phase_yi = []
+		self._phase_zi = []
+		self._phase_durations = []
+		self._phase_start_time = None
+		self._current_phase_name = ""
+		self._redraw_live_scene()
+
+	def set_live_phase_curves(
+		self,
+		phase_name: str,
+		splines: list[CubicBezierSpline],
+		segment_duration: float,
+	) -> None:
+		"""Plot the full trajectory curve for the currently flying phase."""
+		if self._mode != "live":
+			return
+
+		phase_xi: list[np.ndarray] = []
+		phase_yi: list[np.ndarray] = []
+		phase_zi: list[np.ndarray] = []
+
+		for spline in splines:
+			n_segments = len(spline.beziers)
+			if n_segments <= 0:
+				phase_xi.append(np.array([], dtype=float))
+				phase_yi.append(np.array([], dtype=float))
+				phase_zi.append(np.array([], dtype=float))
+				continue
+
+			t_fine = np.linspace(0, n_segments, max(2, n_segments * POINTS_PER_SEGMENT + 1))
+			points = np.array([spline.evaluate(t) for t in t_fine])
+			phase_xi.append(points[:, 0])
+			phase_yi.append(points[:, 1])
+			phase_zi.append(points[:, 2])
+
+		self._phase_xi = phase_xi
+		self._phase_yi = phase_yi
+		self._phase_zi = phase_zi
+		self._phase_durations = [len(spline.beziers) * segment_duration for spline in splines]
+		self._phase_start_time = time.perf_counter()
+		self._current_phase_name = phase_name
+		self._redraw_live_scene()
+
+	def _redraw_live_scene(self) -> None:
+		"""Rebuild live scene preserving measured trail data and current phase curve."""
+		self._fig.clf()
+		self._ax = self._fig.add_subplot(111, projection="3d")
+
+		colors = plt.cm.tab10.colors
+		self._trails = []
+		self._markers = []
+		self._target_markers = []
+
+		for n in range(self._n_drones):
+			if n < len(self._phase_xi) and len(self._phase_xi[n]) > 0:
+				self._ax.plot(
+					self._phase_xi[n],
+					self._phase_yi[n],
+					self._phase_zi[n],
+					color=colors[n % len(colors)],
+					linewidth=0.8,
+					alpha=0.25,
+				)
+
+			trail, = self._ax.plot([], [], [], color=colors[n % len(colors)], linewidth=1.5)
+			marker, = self._ax.plot(
+				[],
+				[],
+				[],
+				"o",
+				color=colors[n % len(colors)],
+				markersize=8,
+				label=f"Drone {n}",
+			)
+			target_marker, = self._ax.plot(
+				[],
+				[],
+				[],
+				"x",
+				color=colors[n % len(colors)],
+				markersize=8,
+				markeredgewidth=2.0,
+			)
+			self._trails.append(trail)
+			self._markers.append(marker)
+			self._target_markers.append(target_marker)
+
+			if n < len(self._all_xi) and len(self._all_xi[n]) > 0:
+				start = max(0, len(self._all_xi[n]) - self._trail_len)
+				trail.set_data_3d(
+					self._all_xi[n][start:],
+					self._all_yi[n][start:],
+					self._all_zi[n][start:],
+				)
+				marker.set_data_3d(
+					[self._all_xi[n][-1]],
+					[self._all_yi[n][-1]],
+					[self._all_zi[n][-1]],
+				)
+
+			if n < len(self._phase_xi) and len(self._phase_xi[n]) > 0:
+				target_marker.set_data_3d(
+					[self._phase_xi[n][0]],
+					[self._phase_yi[n][0]],
+					[self._phase_zi[n][0]],
+				)
+
+		self._ax.set_xlabel("X (m)")
+		self._ax.set_ylabel("Y (m)")
+		self._ax.set_zlabel("Z (m)")
+		self._set_testbed_axes()
+		title = f"Live measured positions - {self._n_drones} drone(s)"
+		if self._current_phase_name:
+			title += f" | phase: {self._current_phase_name}"
+		self._ax.set_title(title)
+		self._ax.legend(ncols=2, loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0)
+
+		self._fig.tight_layout()
+		self._canvas.draw_idle()
+
+	def update_live_positions(self, positions: list[tuple[float, float, float] | None]) -> None:
+		"""Update live mode with newest measured positions for each drone."""
+		if self._mode != "live" or not positions:
+			return
+
+		n_drones = min(self._n_drones, len(positions))
+		for idx in range(n_drones):
+			pos = positions[idx]
+			if pos is None:
+				continue
+
+			x, y, z = pos
+			self._all_xi[idx] = np.append(self._all_xi[idx], x)
+			self._all_yi[idx] = np.append(self._all_yi[idx], y)
+			self._all_zi[idx] = np.append(self._all_zi[idx], z)
+
+			start = max(0, len(self._all_xi[idx]) - self._trail_len)
+			self._trails[idx].set_data_3d(
+				self._all_xi[idx][start:],
+				self._all_yi[idx][start:],
+				self._all_zi[idx][start:],
+			)
+			self._markers[idx].set_data_3d([x], [y], [z])
+
+		if self._phase_start_time is not None:
+			elapsed = max(0.0, time.perf_counter() - self._phase_start_time)
+			for idx in range(min(n_drones, len(self._target_markers), len(self._phase_xi), len(self._phase_durations))):
+				if len(self._phase_xi[idx]) == 0:
+					continue
+
+				duration = max(self._phase_durations[idx], 1e-6)
+				progress = min(1.0, elapsed / duration)
+				frame_idx = int(round(progress * (len(self._phase_xi[idx]) - 1)))
+				self._target_markers[idx].set_data_3d(
+					[self._phase_xi[idx][frame_idx]],
+					[self._phase_yi[idx][frame_idx]],
+					[self._phase_zi[idx][frame_idx]],
+				)
+
+		self._canvas.draw_idle()
+
+	def stop_live_mode(self) -> None:
+		"""Leave live mode and keep current view until next simulation starts."""
+		self._mode = "simulation"
+		self._phase_start_time = None
 
 	def start_simulation(
 		self,
@@ -80,24 +270,88 @@ class MiddlePanel(QFrame):
 		num_trials: int,
 	) -> bool:
 		"""Load all phase CSVs and (re)start the full show animation."""
+		self._mode = "simulation"
 		self._timer.stop()
+
+		full_show = self._build_full_show_data(
+			takeoff_csv_path,
+			active_csv_path,
+			landing_csv_path,
+			dt_start,
+			dt_show,
+			num_trials,
+		)
+		if full_show is None:
+			return False
+
+		all_xi, all_yi, all_zi, frame_times = full_show
+
+		if not all_xi:
+			self._show_message("No trajectory points to render")
+			return False
+
+		self._all_xi = all_xi
+		self._all_yi = all_yi
+		self._all_zi = all_zi
+		self._frame_times = frame_times
+		self._n_drones = len(all_xi)
+		self._n_frames = len(all_xi[0])
+		self._frame_idx = 0
+
+		self._build_scene()
+
+		self._seconds_per_frame = max(dt_show / POINTS_PER_SEGMENT, 1e-6)
+		self._sim_start_time = time.perf_counter()
+		self._last_rendered_frame = -1
+
+		# Timer cadence is decoupled from simulation cadence.
+		# Each tick renders the frame that should be visible "now" and
+		# naturally skips intermediate frames if rendering falls behind.
+		self._timer.start(16)
+		self._canvas.draw_idle()
+		return True
+
+	def _build_full_show_data(
+		self,
+		takeoff_csv_path: Path,
+		active_csv_path: Path,
+		landing_csv_path: Path,
+		dt_start: float,
+		dt_show: float,
+		num_trials: int,
+	) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], np.ndarray] | None:
+		"""Load all phase CSVs and assemble full-show sampled paths."""
 
 		takeoff_xyz = self._load_phase_trajectories(takeoff_csv_path)
 		if takeoff_xyz is None:
-			return False
+			return None
 
-		show_forward_xyz = self._load_phase_trajectories(active_csv_path)
+		takeoff_last_waypoints = self._load_phase_last_waypoints(takeoff_csv_path)
+		if takeoff_last_waypoints is None:
+			return None
+
+		show_forward_xyz = self._load_phase_trajectories(
+			active_csv_path,
+			prepend_points=takeoff_last_waypoints,
+		)
 		if show_forward_xyz is None:
-			return False
+			return None
 
-		landing_xyz = self._load_phase_trajectories(landing_csv_path)
+		show_last_waypoints = self._load_phase_last_waypoints(active_csv_path)
+		if show_last_waypoints is None:
+			return None
+
+		landing_xyz = self._load_phase_trajectories(
+			landing_csv_path,
+			prepend_points=show_last_waypoints,
+		)
 		if landing_xyz is None:
-			return False
+			return None
 
 		n_drones = len(show_forward_xyz[0])
 		if len(takeoff_xyz[0]) != n_drones or len(landing_xyz[0]) != n_drones:
 			self._show_message("Phase CSV files contain different drone counts")
-			return False
+			return None
 
 		show_backward_xyz = tuple(
 			[np.flip(arr, axis=0) for arr in axis_set]
@@ -120,33 +374,52 @@ class MiddlePanel(QFrame):
 		)
 
 		if not all_xi:
-			self._show_message("No trajectory points to render")
-			return False
+			return None
 
-		self._all_xi = all_xi
-		self._all_yi = all_yi
-		self._all_zi = all_zi
-		self._frame_times = frame_times
-		self._n_drones = n_drones
-		self._n_frames = len(all_xi[0])
-		self._frame_idx = 0
+		return all_xi, all_yi, all_zi, frame_times
 
-		self._build_scene()
+	def _load_phase_last_waypoints(self, csv_path: Path) -> list[np.ndarray] | None:
+		try:
+			df = pd.read_csv(csv_path)
+		except OSError:
+			self._show_message(f"Could not open {csv_path.name}")
+			return None
 
-		self._seconds_per_frame = phase_durations["show"]
-		self._sim_start_time = time.perf_counter()
-		self._last_rendered_frame = -1
+		x_columns = sorted(
+			(col for col in df.columns if col.startswith("x")),
+			key=lambda name: int(name[1:]) if name[1:].isdigit() else 10**9,
+		)
+		n_drones = len(x_columns)
+		if n_drones == 0:
+			self._show_message(f"No xN,yN,zN columns found in {csv_path.name}")
+			return None
 
-		# Timer cadence is decoupled from simulation cadence.
-		# Each tick renders the frame that should be visible "now" and
-		# naturally skips intermediate frames if rendering falls behind.
-		self._timer.start(16)
-		self._canvas.draw_idle()
-		return True
+		last_waypoints: list[np.ndarray] = []
+		for n in range(n_drones):
+			try:
+				waypoints = np.column_stack(
+					(
+						df[f"x{n}"].values,
+						df[f"y{n}"].values,
+						df[f"z{n}"].values,
+					)
+				)
+			except KeyError:
+				self._show_message(f"Missing axis columns for drone index {n} in {csv_path.name}")
+				return None
+
+			if len(waypoints) == 0:
+				self._show_message(f"No waypoints found for drone index {n} in {csv_path.name}")
+				return None
+
+			last_waypoints.append(waypoints[-1])
+
+		return last_waypoints
 
 	def _load_phase_trajectories(
 		self,
 		csv_path: Path,
+		prepend_points: list[np.ndarray] | None = None,
 	) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]] | None:
 		try:
 			df = pd.read_csv(csv_path)
@@ -163,16 +436,42 @@ class MiddlePanel(QFrame):
 			self._show_message(f"No xN,yN,zN columns found in {csv_path.name}")
 			return None
 
+		if prepend_points is not None and len(prepend_points) != n_drones:
+			self._show_message("Phase CSV files contain different drone counts")
+			return None
+
 		all_xi: list[np.ndarray] = []
 		all_yi: list[np.ndarray] = []
 		all_zi: list[np.ndarray] = []
 
 		for n in range(n_drones):
 			try:
+				waypoints = np.column_stack(
+					(
+						df[f"x{n}"].values,
+						df[f"y{n}"].values,
+						df[f"z{n}"].values,
+					)
+				)
+				if prepend_points is not None:
+					repeated_prepend = np.repeat(
+						prepend_points[n][np.newaxis, :],
+						STITCH_POINT_REPEAT,
+						axis=0,
+					)
+					waypoints = np.vstack((repeated_prepend, waypoints))
+
+				repeated_point = np.repeat(
+					waypoints[-1][np.newaxis, :],
+					STITCH_POINT_REPEAT,
+					axis=0,
+				)
+				waypoints = np.vstack((waypoints, repeated_point))
+
 				xi, yi, zi = interpolate_trajectory(
-					df[f"x{n}"].values,
-					df[f"y{n}"].values,
-					df[f"z{n}"].values,
+					waypoints[:, 0],
+					waypoints[:, 1],
+					waypoints[:, 2],
 				)
 			except KeyError:
 				self._show_message(f"Missing axis columns for drone index {n} in {csv_path.name}")
@@ -298,17 +597,19 @@ class MiddlePanel(QFrame):
 		all_x = np.concatenate(self._all_xi)
 		all_y = np.concatenate(self._all_yi)
 		all_z = np.concatenate(self._all_zi)
-		pad = 0.2
 
-		self._ax.set_xlim(all_x.min() - pad, all_x.max() + pad)
-		self._ax.set_ylim(all_y.min() - pad, all_y.max() + pad)
-		self._ax.set_zlim(all_z.min() - pad, all_z.max() + pad)
+		self._set_testbed_axes()
 		self._ax.set_xlabel("X (m)")
 		self._ax.set_ylabel("Y (m)")
 		self._ax.set_zlabel("Z (m)")
 		self._ax.set_title(f"Full show trajectories - {self._n_drones} drone(s)")
 		self._ax.legend(ncols=2, loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0)
 		self._fig.tight_layout()
+
+	def _set_testbed_axes(self) -> None:
+		self._ax.set_xlim(TESTBED_X_MIN, TESTBED_X_MAX)
+		self._ax.set_ylim(TESTBED_Y_MIN, TESTBED_Y_MAX)
+		self._ax.set_zlim(TESTBED_Z_MIN, TESTBED_Z_MAX)
 
 	def _update_frame(self) -> None:
 		if self._n_frames == 0:
