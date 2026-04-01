@@ -585,6 +585,7 @@ class MainWindow(QMainWindow):
         self.panel_left.set_fly_enabled(False)
         self.panel_center.start_live_mode(n_drones)
 
+        needs_landing = False
         try:
             print("Applying initial controller parameters...")
             # for cf in self._connected_cfs:
@@ -640,6 +641,7 @@ class MainWindow(QMainWindow):
             await asyncio.gather(
                 *[cf.platform().send_arming_request(True) for cf in self._connected_cfs]
             )
+            needs_landing = True
             await self._sleep_with_live_updates(1.0)
 
             print("Taking off...")
@@ -871,6 +873,7 @@ class MainWindow(QMainWindow):
                     for idx, cf in enumerate(self._connected_cfs)
                 ]
             )
+            needs_landing = False
             await self._sleep_with_live_updates(2.5)
 
             await asyncio.gather(
@@ -886,6 +889,15 @@ class MainWindow(QMainWindow):
             await self._sm.transition(AppState.ERROR)
             QMessageBox.critical(self, "Flight Failed", f"Flight sequence failed: {exc}")
         finally:
+            if needs_landing and self._connected_cfs:
+                print("Emergency landing...")
+                await asyncio.gather(
+                    *[
+                        cf.high_level_commander().land(0.0, None, 3.0, None)
+                        for cf in self._connected_cfs
+                    ],
+                    return_exceptions=True,
+                )
             await self._stop_live_position_logging()
             self.panel_center.stop_live_mode()
             if self._connected_cfs:
