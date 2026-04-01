@@ -26,6 +26,7 @@ class LeftPanel(QFrame):
     connect_requested = pyqtSignal(str, int)
     disconnect_requested = pyqtSignal()
     fly_requested = pyqtSignal()
+    emergency_land_requested = pyqtSignal()
 
     class PanelState(Enum):
         LOAD_CSV = auto()
@@ -158,6 +159,16 @@ class LeftPanel(QFrame):
         self._disconnect_btn.clicked.connect(self.disconnect_requested.emit)
         layout.addWidget(self._disconnect_btn)
 
+        self._emergency_land_btn = QPushButton("Emergency Land")
+        self._emergency_land_btn.clicked.connect(self.emergency_land_requested.emit)
+        self._emergency_land_btn.setEnabled(False)
+        self._emergency_land_btn.setStyleSheet(
+            "QPushButton { background-color: #c0392b; color: white; font-weight: bold; }"
+            "QPushButton:hover { background-color: #e74c3c; }"
+            "QPushButton:disabled { background-color: #888888; color: #cccccc; }"
+        )
+        layout.addWidget(self._emergency_land_btn)
+
         self._apply_state_ui()
 
         layout.addStretch(1)
@@ -207,6 +218,7 @@ class LeftPanel(QFrame):
 
     def set_fly_enabled(self, enabled: bool) -> None:
         self._fly_btn.setEnabled(enabled)
+        self._emergency_land_btn.setEnabled(enabled)
 
     def _apply_state_ui(self) -> None:
         if self._state == self.PanelState.LOAD_CSV:

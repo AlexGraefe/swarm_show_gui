@@ -156,6 +156,7 @@ class MainWindow(QMainWindow):
         self.panel_left.connect_requested.connect(self._on_connect_clicked)
         self.panel_left.disconnect_requested.connect(self._on_disconnect_clicked)
         self.panel_left.fly_requested.connect(self._on_fly_clicked)
+        self.panel_left.emergency_land_requested.connect(self._on_emergency_land_clicked)
         self.panel_center = MiddlePanel()
         self.panel_right  = self._make_panel("Controls")   # buttons, log output
 
@@ -222,6 +223,9 @@ class MainWindow(QMainWindow):
 
     def _on_disconnect_clicked(self) -> None:
         asyncio.create_task(self._disconnect_and_set_idle())
+
+    def _on_emergency_land_clicked(self) -> None:
+        asyncio.create_task(self._emergency_land_drones())
 
     def _on_fly_clicked(self) -> None:
         if not self._connected_cfs:
@@ -314,6 +318,42 @@ class MainWindow(QMainWindow):
 
         await self._disconnect_all_drones()
         await self._sm.transition(AppState.IDLE)
+
+    async def _emergency_land_drones(self) -> None:
+        if not self._connected_cfs:
+            return
+
+        # Cancel any in-progress fly task first.
+        if self._fly_task is not None and not self._fly_task.done():
+            self._fly_task.cancel()
+            await asyncio.gather(self._fly_task, return_exceptions=True)
+            self._fly_task = None
+
+        await self._sm.transition(AppState.LANDING)
+        print("Emergency land: commanding all drones to land...")
+        try:
+            await asyncio.gather(
+                *[
+                    cf.high_level_commander().land(0.0, None, 2.0, None)
+                    for cf in self._connected_cfs
+                ],
+                return_exceptions=True,
+            )
+            await asyncio.sleep(3.0)
+            await asyncio.gather(
+                *[cf.high_level_commander().stop(None) for cf in self._connected_cfs],
+                return_exceptions=True,
+            )
+            await asyncio.gather(
+                *[cf.platform().send_arming_request(False) for cf in self._connected_cfs],
+                return_exceptions=True,
+            )
+        except Exception as exc:
+            print(f"Emergency land error: {exc}")
+        finally:
+            await self._stop_live_position_logging()
+            self.panel_center.stop_live_mode()
+            await self._sm.transition(AppState.READY)
 
     @staticmethod
     def _load_phase_waypoints(
