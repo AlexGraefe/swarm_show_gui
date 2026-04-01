@@ -51,6 +51,7 @@ TAKEOFF_HEIGHT = 1.0
 TAKEOFF_DURATION = 2.0
 GO_TO_START_DURATION = 2.0
 GO_TO_PAD_DURATION = 3.0
+GO_TO_END_DURATION = 1.0
 LOG_INTERVAL = 100  # ms
 STITCH_POINT_REPEAT = 10
 
@@ -133,7 +134,6 @@ class MainWindow(QMainWindow):
         self._live_log_tasks: list[asyncio.Task] = []
         self._live_log_streams: list[object] = []
         self._latest_positions: list[dict[str, Any]] = []
-        self._live_view_task: asyncio.Task | None = None
 
         self.setWindowTitle("Swarm Controller")
         self.resize(1600, 900)
@@ -218,14 +218,49 @@ class MainWindow(QMainWindow):
         self._connect_task = asyncio.create_task(
             self._connect_drones(base_address, num_drones)
         )
+        self._connect_task.add_done_callback(self._on_connect_task_done)
 
     def _on_disconnect_clicked(self) -> None:
         asyncio.create_task(self._disconnect_and_set_idle())
 
     def _on_fly_clicked(self) -> None:
-        if self._fly_task is not None and not self._fly_task.done():
+        if not self._connected_cfs:
+            QMessageBox.warning(self, "Not Connected", "Connect to drones before starting flight.")
             return
+
+        if self._sm.state == AppState.CONNECTING:
+            QMessageBox.information(self, "Please Wait", "Connection is still in progress.")
+            return
+
+        if self._fly_task is not None:
+            if self._fly_task.done():
+                # Recover from stale handles left by prior runs.
+                self._fly_task = None
+            else:
+                if self._sm.state not in (AppState.FLYING, AppState.LANDING):
+                    # A non-flying live task is stale; cancel and recover.
+                    self._fly_task.cancel()
+                    self._fly_task = None
+                else:
+                    QMessageBox.information(self, "Flight In Progress", "A flight sequence is already running.")
+                    return
+
         self._fly_task = asyncio.create_task(self._fly_connected_drones())
+        self._fly_task.add_done_callback(self._on_fly_task_done)
+
+    def _on_connect_task_done(self, task: asyncio.Task) -> None:
+        # Keep task references short-lived so reconnect attempts are never blocked.
+        self._connect_task = None
+        if task.cancelled():
+            return
+        _ = task.exception()
+
+    def _on_fly_task_done(self, task: asyncio.Task) -> None:
+        # Always clear stale task handles so a second flight can be started.
+        self._fly_task = None
+        if task.cancelled():
+            return
+        _ = task.exception()
 
     async def _connect_drones(self, base_address: str, num_drones: int) -> None:
         await self._sm.transition(AppState.CONNECTING)
@@ -272,6 +307,11 @@ class MainWindow(QMainWindow):
         self.panel_left.set_fly_enabled(False)
 
     async def _disconnect_and_set_idle(self) -> None:
+        if self._fly_task is not None and not self._fly_task.done():
+            self._fly_task.cancel()
+            await asyncio.gather(self._fly_task, return_exceptions=True)
+            self._fly_task = None
+
         await self._disconnect_all_drones()
         await self._sm.transition(AppState.IDLE)
 
@@ -374,8 +414,9 @@ class MainWindow(QMainWindow):
             coeffs,
             start_addr=offset,
         ) 
+        print(f"Uploaded trajectory {trajectory_id} ({bytes_written} bytes)")
         await cf.high_level_commander().define_trajectory(trajectory_id, offset, len(spline.beziers), 1)
-        return len(spline.beziers) * segment_duration, bytes_written
+        return len(spline.beziers) * segment_duration, bytes_written + 128
 
     @staticmethod
     async def _read_pad_position(cf: object) -> tuple[float, float, float]:
@@ -385,19 +426,24 @@ class MainWindow(QMainWindow):
         await block.add_variable("stateEstimate.y")
         await block.add_variable("stateEstimate.z")
         log_stream = await block.start(LOG_INTERVAL)
-        values = (await log_stream.next()).data
-        return (
-            float(values["stateEstimate.x"]),
-            float(values["stateEstimate.y"]),
-            float(values["stateEstimate.z"]),
-        )
+        try:
+            values = (await log_stream.next()).data
+            return (
+                float(values["stateEstimate.x"]),
+                float(values["stateEstimate.y"]),
+                float(values["stateEstimate.z"]),
+            )
+        finally:
+            await log_stream.stop()
 
     async def _start_live_position_logging(self) -> None:
+        # Keep telemetry on the single flight coroutine path (no background
+        # asyncio logging tasks) to avoid Python 3.12/qasync re-entrancy issues.
         self._latest_positions = [{"data": None} for _ in self._connected_cfs]
         self._live_log_streams = []
         self._live_log_tasks = []
 
-        for idx, cf in enumerate(self._connected_cfs):
+        for cf in self._connected_cfs:
             log = cf.log()
             block = await log.create_block()
             await block.add_variable("stateEstimate.x")
@@ -405,12 +451,58 @@ class MainWindow(QMainWindow):
             await block.add_variable("stateEstimate.z")
             log_stream = await block.start(LOG_INTERVAL)
             self._live_log_streams.append(log_stream)
-            self._live_log_tasks.append(
-                asyncio.create_task(drain_log(log_stream, self._latest_positions[idx]))
-            )
 
-        if self._live_view_task is None or self._live_view_task.done():
-            self._live_view_task = asyncio.create_task(self._run_live_view_updates())
+    def _push_latest_positions_to_view(self) -> None:
+        positions: list[tuple[float, float, float] | None] = []
+        for last in self._latest_positions:
+            data = last.get("data")
+            if not data:
+                positions.append(None)
+                continue
+            positions.append(
+                (
+                    float(data["stateEstimate.x"]),
+                    float(data["stateEstimate.y"]),
+                    float(data["stateEstimate.z"]),
+                )
+            )
+        self.panel_center.update_live_positions(positions)
+
+    async def _poll_live_positions_once(self, max_wait: float = 0.12) -> None:
+        if not self._live_log_streams:
+            return
+
+        samples = await asyncio.gather(
+            *[
+                asyncio.wait_for(stream.next(), timeout=max_wait)
+                for stream in self._live_log_streams
+            ],
+            return_exceptions=True,
+        )
+
+        for idx, sample in enumerate(samples):
+            if isinstance(sample, Exception):
+                continue
+            self._latest_positions[idx]["data"] = sample.data
+
+        self._push_latest_positions_to_view()
+
+    async def _sleep_with_live_updates(self, duration: float) -> None:
+        if duration <= 0:
+            return
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + duration
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+
+            step = min(0.12, remaining)
+            if self._live_log_streams:
+                await self._poll_live_positions_once(max_wait=step)
+            else:
+                await asyncio.sleep(step)
 
     async def _run_live_view_updates(self) -> None:
         while True:
@@ -433,14 +525,7 @@ class MainWindow(QMainWindow):
     async def _stop_live_position_logging(self) -> None:
         for task in self._live_log_tasks:
             task.cancel()
-        if self._live_log_tasks:
-            await asyncio.gather(*self._live_log_tasks, return_exceptions=True)
         self._live_log_tasks = []
-
-        if self._live_view_task is not None:
-            self._live_view_task.cancel()
-            await asyncio.gather(self._live_view_task, return_exceptions=True)
-            self._live_view_task = None
 
         for stream in self._live_log_streams:
             stop = getattr(stream, "stop", None)
@@ -502,12 +587,12 @@ class MainWindow(QMainWindow):
 
         try:
             print("Applying initial controller parameters...")
-            for cf in self._connected_cfs:
-                param = cf.param()
-                param.set("landingCrtl.hOffset", 0.02)
-                param.set("landingCrtl.hDuration", 1.0)
-                param.set("ctrlMel.ki_z", 1.5)
-                param.set("stabilizer.controller", 1)
+            # for cf in self._connected_cfs:
+            #     param = cf.param()
+            #     param.set("landingCrtl.hOffset", 0.02)
+            #     param.set("landingCrtl.hDuration", 1.0)
+            #     param.set("ctrlMel.ki_z", 1.5)
+            #     param.set("stabilizer.controller", 1)
 
             print("Reading pad positions...")
             pad_positions = list(
@@ -555,7 +640,7 @@ class MainWindow(QMainWindow):
             await asyncio.gather(
                 *[cf.platform().send_arming_request(True) for cf in self._connected_cfs]
             )
-            await asyncio.sleep(1.0)
+            await self._sleep_with_live_updates(1.0)
 
             print("Taking off...")
             await asyncio.gather(
@@ -569,7 +654,7 @@ class MainWindow(QMainWindow):
                     for cf in self._connected_cfs
                 ]
             )
-            await asyncio.sleep(TAKEOFF_DURATION + 1.0)
+            await self._sleep_with_live_updates(TAKEOFF_DURATION + 1.0)
 
             print("Moving to takeoff trajectory start position...")
             await asyncio.gather(
@@ -587,7 +672,7 @@ class MainWindow(QMainWindow):
                     for idx, cf in enumerate(self._connected_cfs)
                 ]
             )
-            await asyncio.sleep(GO_TO_START_DURATION + 1.0)
+            await self._sleep_with_live_updates(GO_TO_START_DURATION + 1.0)
 
             # Run each uploaded trajectory in order.
             print("Starting takeoff trajectory...")
@@ -609,7 +694,26 @@ class MainWindow(QMainWindow):
                     for cf in self._connected_cfs
                 ]
             )
-            await asyncio.sleep(phase_total_durations["takeoff"] + 0.5)
+            await self._sleep_with_live_updates(phase_total_durations["takeoff"] + 2.5)
+
+            print("Moving to begin of show-forward trajectory...")
+            # await asyncio.gather(
+            #     *[
+            #         cf.high_level_commander().go_to(
+            #             takeoff_splines[idx].beziers[-1].p3[0],
+            #             takeoff_splines[idx].beziers[-1].p3[1],
+            #             takeoff_splines[idx].beziers[-1].p3[2],
+            #             0.0,
+            #             GO_TO_END_DURATION,
+            #             relative=False,
+            #             linear=False,
+            #             group_mask=None,
+            #         )
+            #         for idx, cf in enumerate(self._connected_cfs)
+            #     ]
+            # )
+            # await asyncio.sleep(GO_TO_END_DURATION + 0.5)
+            
 
             print(f"Starting show trajectories for {num_trials} trial(s)...")
             print("Show pass 1: forward")
@@ -631,7 +735,7 @@ class MainWindow(QMainWindow):
                     for cf in self._connected_cfs
                 ]
             )
-            await asyncio.sleep(phase_total_durations["show_forward"] + 0.5)
+            await self._sleep_with_live_updates(phase_total_durations["show_forward"] + 0.5)
 
             # Match simulation behavior: F, (B, F) repeated num_trials-1 times.
             for trial_idx in range(2, num_trials + 1):
@@ -654,7 +758,24 @@ class MainWindow(QMainWindow):
                         for cf in self._connected_cfs
                     ]
                 )
-                await asyncio.sleep(phase_total_durations["show_backward"] + 0.5)
+                await self._sleep_with_live_updates(phase_total_durations["show_backward"] + 0.5)
+                print(f"Moving to end of show-backward trajectory for pass {trial_idx}...")
+                await asyncio.gather(
+                    *[
+                        cf.high_level_commander().go_to(
+                            show_backward_splines[idx].beziers[-1].p3[0],
+                            show_backward_splines[idx].beziers[-1].p3[1],
+                            show_backward_splines[idx].beziers[-1].p3[2],
+                            0.0,
+                            GO_TO_END_DURATION,
+                            relative=False,
+                            linear=False,
+                            group_mask=None,
+                        )
+                        for idx, cf in enumerate(self._connected_cfs)
+                    ]
+                )
+                await self._sleep_with_live_updates(GO_TO_END_DURATION + 0.2)
 
                 print(f"Show pass {trial_idx}: forward")
                 self.panel_center.set_live_phase_curves(
@@ -675,7 +796,24 @@ class MainWindow(QMainWindow):
                         for cf in self._connected_cfs
                     ]
                 )
-                await asyncio.sleep(phase_total_durations["show_forward"] + 0.5)
+                await self._sleep_with_live_updates(phase_total_durations["show_forward"] + 0.5)
+                print(f"Moving to end of show-forward trajectory for pass {trial_idx}...")
+                await asyncio.gather(
+                    *[
+                        cf.high_level_commander().go_to(
+                            show_forward_splines[idx].beziers[-1].p3[0],
+                            show_forward_splines[idx].beziers[-1].p3[1],
+                            show_forward_splines[idx].beziers[-1].p3[2],
+                            0.0,
+                            GO_TO_END_DURATION,
+                            relative=False,
+                            linear=False,
+                            group_mask=None,
+                        )
+                        for idx, cf in enumerate(self._connected_cfs)
+                    ]
+                )
+                await self._sleep_with_live_updates(GO_TO_END_DURATION + 0.2)
 
             print("Starting landing trajectory...")
             self.panel_center.set_live_phase_curves(
@@ -696,7 +834,7 @@ class MainWindow(QMainWindow):
                     for cf in self._connected_cfs
                 ]
             )
-            await asyncio.sleep(phase_total_durations["landing"] + 0.5)
+            await self._sleep_with_live_updates(phase_total_durations["landing"] + 0.5)
 
             print("Returning to pad positions...")
             await asyncio.gather(
@@ -714,16 +852,16 @@ class MainWindow(QMainWindow):
                     for idx, cf in enumerate(self._connected_cfs)
                 ]
             )
-            await asyncio.sleep(GO_TO_PAD_DURATION + 0.5)
+            await self._sleep_with_live_updates(GO_TO_PAD_DURATION + 0.5)
 
             print("Applying pre-landing controller parameters...")
-            for cf in self._connected_cfs:
-                param = cf.param()
-                param.set("landingCrtl.hOffset", 0.05)
-                param.set("landingCrtl.hDuration", 1.0)
-                param.set("ctrlMel.ki_z", 1.5)
-                param.set("stabilizer.controller", 1)
-            await asyncio.sleep(2.5)
+            # for cf in self._connected_cfs:
+            #     param = cf.param()
+            #     param.set("landingCrtl.hOffset", 0.05)
+            #     param.set("landingCrtl.hDuration", 1.0)
+            #     param.set("ctrlMel.ki_z", 1.5)
+            #     param.set("stabilizer.controller", 1)
+            await self._sleep_with_live_updates(2.5)
 
             print("Landing...")
             await self._sm.transition(AppState.LANDING)
@@ -733,7 +871,7 @@ class MainWindow(QMainWindow):
                     for idx, cf in enumerate(self._connected_cfs)
                 ]
             )
-            await asyncio.sleep(2.5)
+            await self._sleep_with_live_updates(2.5)
 
             await asyncio.gather(
                 *[cf.high_level_commander().stop(None) for cf in self._connected_cfs]
@@ -752,6 +890,7 @@ class MainWindow(QMainWindow):
             self.panel_center.stop_live_mode()
             if self._connected_cfs:
                 self.panel_left.set_fly_enabled(True)
+            self._fly_task = None
 
     def _on_state_changed(self, state: AppState) -> None:
         """React to every state transition. Expand per-state logic here."""

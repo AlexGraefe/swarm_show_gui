@@ -119,16 +119,35 @@ if __name__ == "__main__":
         [3, 1, 3]
     ])
     spline = CubicBezierSpline.from_waypoints(example_waypoints)
-    t_values = np.linspace(0, len(spline.beziers), 100)
+    t_values = np.linspace(0, len(spline.beziers), 1000)
     points = np.array([spline.evaluate(t) for t in t_values])
     import matplotlib.pyplot as plt
 
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection='3d')
-    ax.plot(points[:, 0], points[:, 1], points[:, 2], 'b-', label='Bezier Spline')
-    ax.scatter(example_waypoints[:, 0], example_waypoints[:, 1], example_waypoints[:, 2], c='r', s=100, label='Waypoints')
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-    ax.legend()
+    fig = plt.figure(figsize=(12, 5))
+    
+    # First subplot: Bezier spline and waypoints
+    ax1 = fig.add_subplot(121, projection='3d')
+    ax1.plot(points[:, 0], points[:, 1], points[:, 2], 'b-', label='Bezier Spline')
+    ax1.scatter(example_waypoints[:, 0], example_waypoints[:, 1], example_waypoints[:, 2], c='r', s=100, label='Waypoints')
+    ax1.set_xlabel('X')
+    ax1.set_ylabel('Y')
+    ax1.set_zlabel('Z')
+    ax1.set_title('Bezier Spline')
+    ax1.legend()
+    
+    # Compute numerical derivative using finite differences
+    derivatives = np.diff(points, axis=0)
+    
+    # Second subplot: Derivative magnitude
+    ax2 = fig.add_subplot(122)
+    t_values_deriv = t_values[:-1]  # One fewer point for derivatives
+    deriv_magnitude = np.linalg.norm(derivatives, axis=1)
+    ax2.plot(t_values_deriv, deriv_magnitude, 'g-', label='Velocity Magnitude')
+    ax2.set_xlabel('t')
+    ax2.set_ylabel('||dP/dt||')
+    ax2.set_title('Derivative Magnitude')
+    ax2.legend()
+    ax2.grid(True)
+    
+    plt.tight_layout()
     plt.show()
