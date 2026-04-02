@@ -32,11 +32,25 @@ TRAJECTORY_IDS = {
 
 TAKEOFF_HEIGHT = 1.0
 TAKEOFF_DURATION = 2.0
+LANDING_DURATION = 3.0
 GO_TO_START_DURATION = 2.0
 GO_TO_PAD_DURATION = 3.0
 GO_TO_END_DURATION = 1.0
 LOG_INTERVAL = 100  # ms
 STITCH_POINT_REPEAT = 10
+STAGGER_STRIDE = 5   # launch/land every Nth drone per round (round 0: idx 0,4,8…; round 1: 1,5,9…)
+STAGGER_DELAY  = TAKEOFF_DURATION + 0.5  # seconds between stagger groups
+
+DRONE_IDX_MAPPING = {
+    0: 18,
+    1: 19,
+    2: 20,
+    3: 21,
+    4: 22,
+    5: 23,
+    6: 24,
+    7: 25,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +267,9 @@ class Swarm:
         dt_start: float,
         dt_show: float,
         num_trials: int,
+        wait_after_takeoff: float = 5.0,
+        wait_between_passes: float = 5.0,
+        wait_before_landing: float = 5.0,
     ) -> None:
         """Start the full flight sequence: takeoff → show → landing.
 
@@ -273,7 +290,8 @@ class Swarm:
                 self._fly_task.cancel()
                 self._fly_task = None
         self._fly_task = asyncio.create_task(
-            self._fly_impl(takeoff_csv, active_csv, landing_csv, dt_start, dt_show, num_trials)
+            self._fly_impl(takeoff_csv, active_csv, landing_csv, dt_start, dt_show, num_trials,
+                           wait_after_takeoff, wait_between_passes, wait_before_landing)
         )
         self._fly_task.add_done_callback(self._on_fly_task_done)
 
@@ -285,6 +303,9 @@ class Swarm:
         dt_start: float,
         dt_show: float,
         num_trials: int,
+        wait_after_takeoff: float = 5.0,
+        wait_between_passes: float = 5.0,
+        wait_before_landing: float = 5.0,
     ) -> None:
         """Internal coroutine that performs the full flight sequence."""
         if not self._connected_cfs:
@@ -329,7 +350,9 @@ class Swarm:
         needs_landing = False
         try:
             print("Applying initial controller parameters...")
-            # for cf in self._connected_cfs:
+            for cf in self._connected_cfs:
+                param = cf.param()
+                param.set("colorLedBot.wrgb8888", 0x000000FF)
             #     param = cf.param()
             #     param.set("landingCrtl.hOffset", 0.02)
             #     param.set("landingCrtl.hDuration", 1.0)
@@ -342,6 +365,23 @@ class Swarm:
                     *[self._read_pad_position(cf) for cf in self._connected_cfs]
                 )
             )
+
+            misaligned = []
+            for idx, pad_pos in enumerate(pad_positions):
+                start = takeoff_splines[idx].beziers[0].p0
+                dx = abs(pad_pos[0] - start[0])
+                dy = abs(pad_pos[1] - start[1])
+                if dx > 0.15 or dy > 0.15:
+                    misaligned.append(
+                        f"  Drone {idx + 1}: pad=({pad_pos[0]:.3f}, {pad_pos[1]:.3f}), "
+                        f"start=({start[0]:.3f}, {start[1]:.3f}), "
+                        f"dx={dx:.3f} m, dy={dy:.3f} m"
+                    )
+            if misaligned:
+                raise ValueError(
+                    "Pad position(s) too far from takeoff start (limit ±0.15 m):\n"
+                    + "\n".join(misaligned)
+                )
 
             print("Starting live position logger streams...")
             await self._start_live_position_logging()
@@ -386,18 +426,18 @@ class Swarm:
             await self._sleep_with_live_updates(1.0)
 
             print("Taking off...")
-            await asyncio.gather(
-                *[
-                    cf.high_level_commander().take_off(
-                        TAKEOFF_HEIGHT,
-                        None,
-                        TAKEOFF_DURATION,
-                        None,
-                    )
-                    for cf in self._connected_cfs
-                ]
-            )
-            await self._sleep_with_live_updates(TAKEOFF_DURATION + 1.0)
+            stagger_groups = self._stagger_groups(n_drones)
+            for group_idx, group in enumerate(stagger_groups):
+                await asyncio.gather(
+                    *[
+                        self._connected_cfs[i].high_level_commander().take_off(
+                            TAKEOFF_HEIGHT, None, TAKEOFF_DURATION, None
+                        )
+                        for i in group
+                    ]
+                )
+                await self._sleep_with_live_updates(STAGGER_DELAY)
+            # await self._sleep_with_live_updates(TAKEOFF_DURATION + 1.0)
 
             print("Moving to takeoff trajectory start position...")
             await asyncio.gather(
@@ -429,7 +469,11 @@ class Swarm:
                     for cf in self._connected_cfs
                 ]
             )
-            await self._sleep_with_live_updates(phase_total_durations["takeoff"] + 2.5)
+            await self._sleep_with_live_updates(phase_total_durations["takeoff"])
+
+            if wait_after_takeoff > 0:
+                print(f"Hovering {wait_after_takeoff}s after takeoff...")
+                await self._sleep_with_live_updates(wait_after_takeoff)
 
             print(f"Starting show trajectories for {num_trials} trial(s)...")
             print("Show pass 1: forward")
@@ -444,10 +488,14 @@ class Swarm:
                     for cf in self._connected_cfs
                 ]
             )
-            await self._sleep_with_live_updates(phase_total_durations["show_forward"] + 0.5)
+            await self._sleep_with_live_updates(phase_total_durations["show_forward"])
 
             # Match simulation behaviour: F, (B, F) repeated num_trials-1 times.
             for trial_idx in range(2, num_trials + 1):
+                if wait_between_passes > 0:
+                    print(f"Waiting {wait_between_passes}s between passes...")
+                    await self._sleep_with_live_updates(wait_between_passes)
+
                 print(f"Show pass {trial_idx}: backward")
                 self._gui.on_phase_changed(
                     "show_backward",
@@ -462,25 +510,12 @@ class Swarm:
                         for cf in self._connected_cfs
                     ]
                 )
-                await self._sleep_with_live_updates(phase_total_durations["show_backward"] + 0.5)
+                await self._sleep_with_live_updates(phase_total_durations["show_backward"])
 
-                print(f"Moving to end of show-backward trajectory for pass {trial_idx}...")
-                await asyncio.gather(
-                    *[
-                        cf.high_level_commander().go_to(
-                            show_backward_splines[idx].beziers[-1].p3[0],
-                            show_backward_splines[idx].beziers[-1].p3[1],
-                            show_backward_splines[idx].beziers[-1].p3[2],
-                            0.0,
-                            GO_TO_END_DURATION,
-                            relative=False,
-                            linear=False,
-                            group_mask=None,
-                        )
-                        for idx, cf in enumerate(self._connected_cfs)
-                    ]
-                )
-                await self._sleep_with_live_updates(GO_TO_END_DURATION + 0.2)
+
+                if wait_between_passes > 0:
+                    print(f"Waiting {wait_between_passes}s between passes...")
+                    await self._sleep_with_live_updates(wait_between_passes)
 
                 print(f"Show pass {trial_idx}: forward")
                 self._gui.on_phase_changed(
@@ -494,25 +529,12 @@ class Swarm:
                         for cf in self._connected_cfs
                     ]
                 )
-                await self._sleep_with_live_updates(phase_total_durations["show_forward"] + 0.5)
+                await self._sleep_with_live_updates(phase_total_durations["show_forward"])
 
-                print(f"Moving to end of show-forward trajectory for pass {trial_idx}...")
-                await asyncio.gather(
-                    *[
-                        cf.high_level_commander().go_to(
-                            show_forward_splines[idx].beziers[-1].p3[0],
-                            show_forward_splines[idx].beziers[-1].p3[1],
-                            show_forward_splines[idx].beziers[-1].p3[2],
-                            0.0,
-                            GO_TO_END_DURATION,
-                            relative=False,
-                            linear=False,
-                            group_mask=None,
-                        )
-                        for idx, cf in enumerate(self._connected_cfs)
-                    ]
-                )
-                await self._sleep_with_live_updates(GO_TO_END_DURATION + 0.2)
+
+            if wait_before_landing > 0:
+                print(f"Hovering {wait_before_landing}s before landing...")
+                await self._sleep_with_live_updates(wait_before_landing)
 
             print("Starting landing trajectory...")
             self._gui.on_phase_changed(
@@ -547,24 +569,30 @@ class Swarm:
             await self._sleep_with_live_updates(GO_TO_PAD_DURATION + 0.5)
 
             print("Applying pre-landing controller parameters...")
-            # for cf in self._connected_cfs:
-            #     param = cf.param()
-            #     param.set("landingCrtl.hOffset", 0.05)
-            #     param.set("landingCrtl.hDuration", 1.0)
+            for cf in self._connected_cfs:
+                param = cf.param()
+                param.set("landingCrtl.hOffset", 0.03)
+                param.set("landingCrtl.hDuration", 1.0)
+                param.set("colorLedBot.wrgb8888", 0x00000000)
             #     param.set("ctrlMel.ki_z", 1.5)
-            #     param.set("stabilizer.controller", 1)
+                param.set("stabilizer.controller", 2)
             await self._sleep_with_live_updates(2.5)
 
             print("Landing...")
             self._set_state(SwarmState.LANDED)
-            await asyncio.gather(
-                *[
-                    cf.high_level_commander().land(pad_positions[idx][2], None, 2.0, None)
-                    for idx, cf in enumerate(self._connected_cfs)
-                ]
-            )
+            stagger_groups = self._stagger_groups(n_drones)
+            for group_idx, group in enumerate(stagger_groups):
+                await asyncio.gather(
+                    *[
+                        self._connected_cfs[i].high_level_commander().land(
+                            pad_positions[i][2], None, LANDING_DURATION, None
+                        )
+                        for i in group
+                    ]
+                )
+                await self._sleep_with_live_updates(LANDING_DURATION + 0.5)
             needs_landing = False
-            await self._sleep_with_live_updates(2.5)
+            # await self._sleep_with_live_updates(2.5)
 
             await asyncio.gather(
                 *[cf.high_level_commander().stop(None) for cf in self._connected_cfs]
@@ -609,6 +637,9 @@ class Swarm:
     async def _disconnect_all(self) -> None:
         if not self._connected_cfs:
             return
+        for cf in self._connected_cfs:
+            param = cf.param()
+            param.set("colorLedBot.wrgb8888", 0x00000000)
         await asyncio.gather(
             *[cf.disconnect() for cf in self._connected_cfs],
             return_exceptions=True,
@@ -709,6 +740,21 @@ class Swarm:
     # -- CSV / spline helpers ------------------------------------------------
 
     @staticmethod
+    def _stagger_groups(n: int, stride: int = STAGGER_STRIDE) -> list:
+        """Return groups of drone indices for staggered launch/land.
+
+        Round 0: [0, stride, 2*stride, ...]
+        Round 1: [1, 1+stride, 1+2*stride, ...]
+        ...
+        """
+        groups = []
+        for offset in range(stride):
+            group = list(range(offset, n, stride))
+            if group:
+                groups.append(group)
+        return groups
+
+    @staticmethod
     def _load_phase_waypoints(
         csv_path: Path,
         n_drones: int,
@@ -726,9 +772,9 @@ class Swarm:
 
         for idx in range(n_drones):
             try:
-                xs = df[f"x{idx+20}"].values
-                ys = df[f"y{idx+20}"].values
-                zs = df[f"z{idx+20}"].values
+                xs = df[f"x{DRONE_IDX_MAPPING[idx]}"].values
+                ys = df[f"y{DRONE_IDX_MAPPING[idx]}"].values
+                zs = df[f"z{DRONE_IDX_MAPPING[idx]}"].values
             except KeyError as exc:
                 raise ValueError(
                     f"{csv_path.name} is missing columns for drone index {idx} "

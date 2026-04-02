@@ -74,6 +74,7 @@ class MiddlePanel(QFrame):
 		self._trails = []
 		self._markers = []
 		self._target_markers = []
+		self._labels = []
 		self._trail_len = POINTS_PER_SEGMENT * 3
 		self._mode = "simulation"
 		self._phase_xi: list[np.ndarray] = []
@@ -146,6 +147,7 @@ class MiddlePanel(QFrame):
 		self._trails = []
 		self._markers = []
 		self._target_markers = []
+		self._labels = []
 
 		for n in range(self._n_drones):
 			if n < len(self._phase_xi) and len(self._phase_xi[n]) > 0:
@@ -177,9 +179,17 @@ class MiddlePanel(QFrame):
 				markersize=8,
 				markeredgewidth=2.0,
 			)
+			label = self._ax.text(
+				0, 0, 0,
+				str(n),
+				color=colors[n % len(colors)],
+				fontsize=8,
+				visible=False,
+			)
 			self._trails.append(trail)
 			self._markers.append(marker)
 			self._target_markers.append(target_marker)
+			self._labels.append(label)
 
 			if n < len(self._all_xi) and len(self._all_xi[n]) > 0:
 				start = max(0, len(self._all_xi[n]) - self._trail_len)
@@ -193,6 +203,9 @@ class MiddlePanel(QFrame):
 					[self._all_yi[n][-1]],
 					[self._all_zi[n][-1]],
 				)
+				label.set_position((self._all_xi[n][-1], self._all_yi[n][-1]))
+				label.set_3d_properties(self._all_zi[n][-1] + 0.1, zdir="z")
+				label.set_visible(True)
 
 			if n < len(self._phase_xi) and len(self._phase_xi[n]) > 0:
 				target_marker.set_data_3d(
@@ -237,6 +250,9 @@ class MiddlePanel(QFrame):
 				self._all_zi[idx][start:],
 			)
 			self._markers[idx].set_data_3d([x], [y], [z])
+			self._labels[idx].set_position((x, y))
+			self._labels[idx].set_3d_properties(z + 0.1, zdir="z")
+			self._labels[idx].set_visible(True)
 
 		if self._phase_start_time is not None:
 			elapsed = max(0.0, time.perf_counter() - self._phase_start_time)
@@ -268,6 +284,9 @@ class MiddlePanel(QFrame):
 		dt_start: float,
 		dt_show: float,
 		num_trials: int,
+		wait_after_takeoff: float = HOVER_SECONDS,
+		wait_between_passes: float = HOVER_SECONDS,
+		wait_before_landing: float = HOVER_SECONDS,
 	) -> bool:
 		"""Load all phase CSVs and (re)start the full show animation."""
 		self._mode = "simulation"
@@ -280,6 +299,9 @@ class MiddlePanel(QFrame):
 			dt_start,
 			dt_show,
 			num_trials,
+			wait_after_takeoff,
+			wait_between_passes,
+			wait_before_landing,
 		)
 		if full_show is None:
 			return False
@@ -319,6 +341,9 @@ class MiddlePanel(QFrame):
 		dt_start: float,
 		dt_show: float,
 		num_trials: int,
+		wait_after_takeoff: float = HOVER_SECONDS,
+		wait_between_passes: float = HOVER_SECONDS,
+		wait_before_landing: float = HOVER_SECONDS,
 	) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], np.ndarray] | None:
 		"""Load all phase CSVs and assemble full-show sampled paths."""
 
@@ -371,6 +396,9 @@ class MiddlePanel(QFrame):
 			landing_xyz,
 			phase_durations,
 			max(1, num_trials),
+			wait_after_takeoff,
+			wait_between_passes,
+			wait_before_landing,
 		)
 
 		if not all_xi:
@@ -491,6 +519,9 @@ class MiddlePanel(QFrame):
 		landing_xyz: tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]],
 		phase_durations: dict[str, float],
 		num_trials: int,
+		wait_after_takeoff: float = HOVER_SECONDS,
+		wait_between_passes: float = HOVER_SECONDS,
+		wait_before_landing: float = HOVER_SECONDS,
 	) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], np.ndarray]:
 		n_drones = len(show_forward_xyz[0])
 		combined_x: list[list[np.ndarray]] = [[] for _ in range(n_drones)]
@@ -547,14 +578,16 @@ class MiddlePanel(QFrame):
 			last_time = float(times[-1])
 
 		append_phase(takeoff_xyz, phase_durations["takeoff"], drop_first=False)
-		append_hover(phase_durations["show"], HOVER_SECONDS)
+		append_hover(phase_durations["show"], wait_after_takeoff)
 
 		append_phase(show_forward_xyz, phase_durations["show"], drop_first=True)
 		for _ in range(num_trials - 1):
+			append_hover(phase_durations["show"], wait_between_passes)
 			append_phase(show_backward_xyz, phase_durations["show"], drop_first=True)
+			append_hover(phase_durations["show"], wait_between_passes)
 			append_phase(show_forward_xyz, phase_durations["show"], drop_first=True)
 
-		append_hover(phase_durations["show"], HOVER_SECONDS)
+		append_hover(phase_durations["show"], wait_before_landing)
 		append_phase(landing_xyz, phase_durations["landing"], drop_first=True)
 
 		all_xi = [np.concatenate(parts) if parts else np.array([]) for parts in combined_x]
@@ -571,6 +604,7 @@ class MiddlePanel(QFrame):
 		colors = plt.cm.tab10.colors
 		self._trails = []
 		self._markers = []
+		self._labels = []
 
 		for n in range(self._n_drones):
 			self._ax.plot(
@@ -591,8 +625,16 @@ class MiddlePanel(QFrame):
 				markersize=8,
 				label=f"Drone {n}",
 			)
+			label = self._ax.text(
+				0, 0, 0,
+				str(n),
+				color=colors[n % len(colors)],
+				fontsize=8,
+				visible=False,
+			)
 			self._trails.append(trail)
 			self._markers.append(marker)
+			self._labels.append(label)
 
 		all_x = np.concatenate(self._all_xi)
 		all_y = np.concatenate(self._all_yi)
@@ -634,11 +676,11 @@ class MiddlePanel(QFrame):
 				self._all_yi[n][start:frame + 1],
 				self._all_zi[n][start:frame + 1],
 			)
-			self._markers[n].set_data_3d(
-				[self._all_xi[n][frame]],
-				[self._all_yi[n][frame]],
-				[self._all_zi[n][frame]],
-			)
+			x, y, z = self._all_xi[n][frame], self._all_yi[n][frame], self._all_zi[n][frame]
+			self._markers[n].set_data_3d([x], [y], [z])
+			self._labels[n].set_position((x, y))
+			self._labels[n].set_3d_properties(z + 0.1, zdir="z")
+			self._labels[n].set_visible(True)
 
 		self._canvas.draw_idle()
 		self._last_rendered_frame = frame

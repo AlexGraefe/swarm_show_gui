@@ -4,7 +4,6 @@
 Three-panel layout:
   Left   – drone fleet / connection status
   Center – 3-D visualisation
-  Right  – controls & log
 
 Entry point: run with  python gui.py
 Requires:  PyQt6  qasync
@@ -122,11 +121,9 @@ class MainWindow(QMainWindow):
         self.panel_left.fly_requested.connect(self._on_fly_clicked)
         self.panel_left.emergency_land_requested.connect(self._on_emergency_land_clicked)
         self.panel_center = MiddlePanel()
-        self.panel_right  = self._make_panel("Controls")   # buttons, log output
 
         root.addWidget(self.panel_left,   stretch=1)
         root.addWidget(self.panel_center, stretch=3)
-        root.addWidget(self.panel_right,  stretch=1)
 
         # Status bar driven by the state machine
         self._status_label = QLabel()
@@ -160,6 +157,9 @@ class MainWindow(QMainWindow):
         dt_start = self.panel_left.get_dt_start_seconds()
         dt_show = self.panel_left.get_dt_show_seconds()
         num_trials = self.panel_left.get_num_trials()
+        wait_after_takeoff = self.panel_left.get_wait_after_takeoff_seconds()
+        wait_between_passes = self.panel_left.get_wait_between_passes_seconds()
+        wait_before_landing = self.panel_left.get_wait_before_landing_seconds()
         started = self.panel_center.start_simulation(
             takeoff_csv_path,
             active_csv_path,
@@ -167,6 +167,9 @@ class MainWindow(QMainWindow):
             dt_start,
             dt_show,
             num_trials,
+            wait_after_takeoff,
+            wait_between_passes,
+            wait_before_landing,
         )
         if not started:
             return
@@ -202,8 +205,12 @@ class MainWindow(QMainWindow):
         dt_start = self.panel_left.get_dt_start_seconds()
         dt_show = self.panel_left.get_dt_show_seconds()
         num_trials = self.panel_left.get_num_trials()
+        wait_after_takeoff = self.panel_left.get_wait_after_takeoff_seconds()
+        wait_between_passes = self.panel_left.get_wait_between_passes_seconds()
+        wait_before_landing = self.panel_left.get_wait_before_landing_seconds()
 
-        self._swarm.fly(takeoff_csv, active_csv, landing_csv, dt_start, dt_show, num_trials)
+        self._swarm.fly(takeoff_csv, active_csv, landing_csv, dt_start, dt_show, num_trials,
+                        wait_after_takeoff, wait_between_passes, wait_before_landing)
 
     async def _connect_drones(self, base_address: str, num_drones: int) -> None:
         await self._sm.transition(AppState.CONNECTING)

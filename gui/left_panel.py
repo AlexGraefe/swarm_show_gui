@@ -82,21 +82,33 @@ class LeftPanel(QFrame):
         self._num_trials_input = QLineEdit()
         self._base_address_input = QLineEdit()
         self._num_drones_input = QLineEdit()
+        self._wait_after_takeoff_input = QLineEdit()
+        self._wait_between_passes_input = QLineEdit()
+        self._wait_before_landing_input = QLineEdit()
         self._last_valid_dt_start = "0.1"
         self._last_valid_dt_show = "0.1"
         self._last_valid_num_trials = "1"
         self._last_valid_num_drones = "1"
+        self._last_valid_wait_after_takeoff = "5.0"
+        self._last_valid_wait_between_passes = "5.0"
+        self._last_valid_wait_before_landing = "5.0"
         self._dt_start_input.setText(self._last_valid_dt_start)
         self._dt_show_input.setText(self._last_valid_dt_show)
         self._num_trials_input.setText(self._last_valid_num_trials)
         self._base_address_input.setText("radio://0/75/2M/DB1F1010")
         self._num_drones_input.setText(self._last_valid_num_drones)
+        self._wait_after_takeoff_input.setText(self._last_valid_wait_after_takeoff)
+        self._wait_between_passes_input.setText(self._last_valid_wait_between_passes)
+        self._wait_before_landing_input.setText(self._last_valid_wait_before_landing)
 
         for number_input in (
             self._dt_start_input,
             self._dt_show_input,
             self._num_trials_input,
             self._num_drones_input,
+            self._wait_after_takeoff_input,
+            self._wait_between_passes_input,
+            self._wait_before_landing_input,
         ):
             number_input.setPlaceholderText("0")
 
@@ -124,12 +136,33 @@ class LeftPanel(QFrame):
                 "_last_valid_num_drones",
             )
         )
+        self._wait_after_takeoff_input.returnPressed.connect(
+            lambda: self._validate_and_commit_nonneg_float(
+                self._wait_after_takeoff_input,
+                "_last_valid_wait_after_takeoff",
+            )
+        )
+        self._wait_between_passes_input.returnPressed.connect(
+            lambda: self._validate_and_commit_nonneg_float(
+                self._wait_between_passes_input,
+                "_last_valid_wait_between_passes",
+            )
+        )
+        self._wait_before_landing_input.returnPressed.connect(
+            lambda: self._validate_and_commit_nonneg_float(
+                self._wait_before_landing_input,
+                "_last_valid_wait_before_landing",
+            )
+        )
 
         show_config_layout = QFormLayout()
         show_config_layout.setSpacing(8)
         show_config_layout.addRow("Dt start", self._dt_start_input)
         show_config_layout.addRow("Dt show", self._dt_show_input)
         show_config_layout.addRow("Number Trials", self._num_trials_input)
+        show_config_layout.addRow("Wait after takeoff (s)", self._wait_after_takeoff_input)
+        show_config_layout.addRow("Wait between passes (s)", self._wait_between_passes_input)
+        show_config_layout.addRow("Wait before landing (s)", self._wait_before_landing_input)
         layout.addLayout(show_config_layout)
 
         self._save_config_btn = QPushButton("Save Config")
@@ -206,6 +239,9 @@ class LeftPanel(QFrame):
             self._num_trials_input,
             self._base_address_input,
             self._num_drones_input,
+            self._wait_after_takeoff_input,
+            self._wait_between_passes_input,
+            self._wait_before_landing_input,
         ):
             number_input.setEnabled(enabled)
 
@@ -218,7 +254,7 @@ class LeftPanel(QFrame):
 
     def set_fly_enabled(self, enabled: bool) -> None:
         self._fly_btn.setEnabled(enabled)
-        self._emergency_land_btn.setEnabled(enabled)
+        self._emergency_land_btn.setEnabled(not enabled)
 
     def _apply_state_ui(self) -> None:
         if self._state == self.PanelState.LOAD_CSV:
@@ -253,6 +289,22 @@ class LeftPanel(QFrame):
         setattr(self, last_valid_attr, text)
         input_widget.setText(text)
 
+    def _validate_and_commit_nonneg_float(self, input_widget: QLineEdit, last_valid_attr: str) -> None:
+        text = input_widget.text().strip()
+
+        try:
+            value = float(text)
+        except ValueError:
+            self._restore_last_valid_value(input_widget, last_valid_attr)
+            return
+
+        if value < 0:
+            self._restore_last_valid_value(input_widget, last_valid_attr)
+            return
+
+        setattr(self, last_valid_attr, text)
+        input_widget.setText(text)
+
     def _validate_and_commit_int(self, input_widget: QLineEdit, last_valid_attr: str) -> None:
         text = input_widget.text().strip()
 
@@ -279,6 +331,9 @@ class LeftPanel(QFrame):
             "dt_start": self.get_dt_start_seconds(),
             "dt_show": self.get_dt_show_seconds(),
             "num_trials": self.get_num_trials(),
+            "wait_after_takeoff": self.get_wait_after_takeoff_seconds(),
+            "wait_between_passes": self.get_wait_between_passes_seconds(),
+            "wait_before_landing": self.get_wait_before_landing_seconds(),
         }
 
     def _set_config_data(self, data: dict) -> None:
@@ -300,6 +355,25 @@ class LeftPanel(QFrame):
             value = str(num_trials)
             self._last_valid_num_trials = value
             self._num_trials_input.setText(value)
+
+        wait_after_takeoff = data.get("wait_after_takeoff")
+        wait_between_passes = data.get("wait_between_passes")
+        wait_before_landing = data.get("wait_before_landing")
+
+        if isinstance(wait_after_takeoff, (int, float)) and float(wait_after_takeoff) >= 0:
+            value = str(float(wait_after_takeoff))
+            self._last_valid_wait_after_takeoff = value
+            self._wait_after_takeoff_input.setText(value)
+
+        if isinstance(wait_between_passes, (int, float)) and float(wait_between_passes) >= 0:
+            value = str(float(wait_between_passes))
+            self._last_valid_wait_between_passes = value
+            self._wait_between_passes_input.setText(value)
+
+        if isinstance(wait_before_landing, (int, float)) and float(wait_before_landing) >= 0:
+            value = str(float(wait_before_landing))
+            self._last_valid_wait_before_landing = value
+            self._wait_before_landing_input.setText(value)
 
     def _load_config_if_exists(self, folder_path: Path) -> None:
         config_path = folder_path / self.CONFIG_FILE_NAME
@@ -509,4 +583,32 @@ class LeftPanel(QFrame):
         self._last_valid_num_drones = str(value)
         self._num_drones_input.setText(self._last_valid_num_drones)
         return value
+
+    def _get_nonneg_float(self, input_widget: QLineEdit, last_valid_attr: str) -> float:
+        text = input_widget.text().strip()
+        fallback = getattr(self, last_valid_attr)
+        try:
+            value = float(text)
+        except ValueError:
+            value = float(fallback)
+        if value < 0:
+            value = float(fallback)
+        setattr(self, last_valid_attr, str(value))
+        input_widget.setText(str(value))
+        return value
+
+    def get_wait_after_takeoff_seconds(self) -> float:
+        return self._get_nonneg_float(
+            self._wait_after_takeoff_input, "_last_valid_wait_after_takeoff"
+        )
+
+    def get_wait_between_passes_seconds(self) -> float:
+        return self._get_nonneg_float(
+            self._wait_between_passes_input, "_last_valid_wait_between_passes"
+        )
+
+    def get_wait_before_landing_seconds(self) -> float:
+        return self._get_nonneg_float(
+            self._wait_before_landing_input, "_last_valid_wait_before_landing"
+        )
 
