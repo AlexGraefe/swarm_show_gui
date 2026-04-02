@@ -6,6 +6,7 @@ It reports progress back to whatever object implements :class:`SwarmGUI`
 """
 
 import asyncio
+import re
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Protocol
@@ -37,20 +38,11 @@ GO_TO_START_DURATION = 2.0
 GO_TO_PAD_DURATION = 3.0
 GO_TO_END_DURATION = 1.0
 LOG_INTERVAL = 100  # ms
-STITCH_POINT_REPEAT = 10
+STITCH_POINT_REPEAT = 3
 STAGGER_STRIDE = 5   # launch/land every Nth drone per round (round 0: idx 0,4,8…; round 1: 1,5,9…)
 STAGGER_DELAY  = TAKEOFF_DURATION + 0.5  # seconds between stagger groups
+CSV_LOAD_STRIDE = 2
 
-DRONE_IDX_MAPPING = {
-    0: 18,
-    1: 19,
-    2: 20,
-    3: 21,
-    4: 22,
-    5: 23,
-    6: 24,
-    7: 25,
-}
 
 
 # ---------------------------------------------------------------------------
@@ -321,28 +313,6 @@ class Swarm:
             "landing": dt_start,
         }
 
-        try:
-            takeoff_splines = self._load_phase_splines(takeoff_csv, n_drones)
-            takeoff_last_points = self._load_phase_last_points(takeoff_csv, n_drones)
-
-            show_forward_splines = self._load_phase_splines(
-                active_csv,
-                n_drones,
-                prepend_points=takeoff_last_points,
-            )
-            show_backward_splines = self._load_phase_splines_reversed(active_csv, n_drones)
-
-            show_last_points = self._load_phase_last_points(active_csv, n_drones)
-            landing_splines = self._load_phase_splines(
-                landing_csv,
-                n_drones,
-                prepend_points=show_last_points,
-            )
-        except Exception as exc:
-            self._set_state(SwarmState.ERROR)
-            self._gui.on_error("Invalid Trajectory Data", str(exc))
-            return
-
         self._set_state(SwarmState.FLYING)
         self._gui.on_fly_enabled(False)
         self._gui.on_live_mode_started(n_drones)
@@ -357,7 +327,7 @@ class Swarm:
             #     param.set("landingCrtl.hOffset", 0.02)
             #     param.set("landingCrtl.hDuration", 1.0)
             #     param.set("ctrlMel.ki_z", 1.5)
-            #     param.set("stabilizer.controller", 1)
+                param.set("stabilizer.controller", 1)
 
             print("Reading pad positions...")
             pad_positions = list(
@@ -366,22 +336,26 @@ class Swarm:
                 )
             )
 
-            misaligned = []
-            for idx, pad_pos in enumerate(pad_positions):
-                start = takeoff_splines[idx].beziers[0].p0
-                dx = abs(pad_pos[0] - start[0])
-                dy = abs(pad_pos[1] - start[1])
-                if dx > 0.15 or dy > 0.15:
-                    misaligned.append(
-                        f"  Drone {idx + 1}: pad=({pad_pos[0]:.3f}, {pad_pos[1]:.3f}), "
-                        f"start=({start[0]:.3f}, {start[1]:.3f}), "
-                        f"dx={dx:.3f} m, dy={dy:.3f} m"
-                    )
-            if misaligned:
-                raise ValueError(
-                    "Pad position(s) too far from takeoff start (limit ±0.15 m):\n"
-                    + "\n".join(misaligned)
-                )
+            print("Building drone-to-trajectory mapping from pad positions...")
+            drone_idx_mapping = self._build_drone_idx_mapping(takeoff_csv, pad_positions)
+
+            print("Loading trajectory data...")
+            takeoff_splines = self._load_phase_splines(takeoff_csv, n_drones, drone_idx_mapping)
+            takeoff_last_points = self._load_phase_last_points(takeoff_csv, n_drones, drone_idx_mapping)
+            show_forward_splines = self._load_phase_splines(
+                active_csv,
+                n_drones,
+                drone_idx_mapping,
+                prepend_points=takeoff_last_points,
+            )
+            show_backward_splines = self._load_phase_splines_reversed(active_csv, n_drones, drone_idx_mapping)
+            show_last_points = self._load_phase_last_points(active_csv, n_drones, drone_idx_mapping)
+            landing_splines = self._load_phase_splines(
+                landing_csv,
+                n_drones,
+                drone_idx_mapping,
+                prepend_points=show_last_points,
+            )
 
             print("Starting live position logger streams...")
             await self._start_live_position_logging()
@@ -571,7 +545,7 @@ class Swarm:
             print("Applying pre-landing controller parameters...")
             for cf in self._connected_cfs:
                 param = cf.param()
-                param.set("landingCrtl.hOffset", 0.03)
+                param.set("landingCrtl.hOffset", 0.02)
                 param.set("landingCrtl.hDuration", 1.0)
                 param.set("colorLedBot.wrgb8888", 0x00000000)
             #     param.set("ctrlMel.ki_z", 1.5)
@@ -740,6 +714,81 @@ class Swarm:
     # -- CSV / spline helpers ------------------------------------------------
 
     @staticmethod
+    def _build_drone_idx_mapping(
+        csv_path: Path,
+        pad_positions: list,
+        tolerance: float = 0.15,
+    ) -> dict:
+        """Build a ``{drone_idx: csv_col_idx}`` mapping at runtime.
+
+        Reads the first row of *csv_path* to get the x/y starting position of
+        every column index found in the file.  Each drone's pad position is then
+        matched to the closest starting point that lies within *tolerance* metres
+        in both x and y.
+
+        Errors are accumulated and raised together so all problems are visible
+        at once:
+
+        * drone not close to any starting point
+        * drone matches multiple starting points
+        * two drones mapped to the same column index
+        """
+        df = pd.read_csv(csv_path)
+        first_row = df.iloc[0]
+
+        col_indices = []
+        for col in df.columns:
+            m = re.match(r"^x(\d+)$", col)
+            if m is not None:
+                col_indices.append(int(m.group(1)))
+        col_indices.sort()
+
+        col_starts = {
+            cidx: (float(first_row[f"x{cidx}"]), float(first_row[f"y{cidx}"]))
+            for cidx in col_indices
+        }
+
+        errors = []
+        mapping = {}
+
+        for drone_idx, pad_pos in enumerate(pad_positions):
+            px, py = pad_pos[0], pad_pos[1]
+            matched = [
+                cidx
+                for cidx, (cx, cy) in col_starts.items()
+                if abs(px - cx) <= tolerance and abs(py - cy) <= tolerance
+            ]
+            if len(matched) == 0:
+                errors.append(
+                    f"  Drone {drone_idx + 1}: pad=({px:.3f}, {py:.3f}) is not within "
+                    f"\u00b1{tolerance:.2f} m of any starting point in {csv_path.name}"
+                )
+            elif len(matched) > 1:
+                errors.append(
+                    f"  Drone {drone_idx + 1}: pad=({px:.3f}, {py:.3f}) matches multiple "
+                    f"starting points: column indices {matched}"
+                )
+            else:
+                mapping[drone_idx] = matched[0]
+
+        seen = {}
+        for drone_idx, cidx in mapping.items():
+            if cidx in seen:
+                errors.append(
+                    f"  Column index {cidx} was assigned to both drone {seen[cidx] + 1} "
+                    f"and drone {drone_idx + 1}"
+                )
+            else:
+                seen[cidx] = drone_idx
+
+        if errors:
+            raise ValueError(
+                "Drone-to-trajectory mapping failed:\n" + "\n".join(errors)
+            )
+
+        return mapping
+
+    @staticmethod
     def _stagger_groups(n: int, stride: int = STAGGER_STRIDE) -> list:
         """Return groups of drone indices for staggered launch/land.
 
@@ -758,10 +807,12 @@ class Swarm:
     def _load_phase_waypoints(
         csv_path: Path,
         n_drones: int,
+        drone_idx_mapping: dict,
         prepend_points: list | None = None,
         reverse: bool = False,
     ) -> list:
         df = pd.read_csv(csv_path)
+        df = df.iloc[::CSV_LOAD_STRIDE]
         waypoints_per_drone: list[np.ndarray] = []
 
         if prepend_points is not None and len(prepend_points) != n_drones:
@@ -771,14 +822,15 @@ class Swarm:
             )
 
         for idx in range(n_drones):
+            col_idx = drone_idx_mapping[idx]
             try:
-                xs = df[f"x{DRONE_IDX_MAPPING[idx]}"].values
-                ys = df[f"y{DRONE_IDX_MAPPING[idx]}"].values
-                zs = df[f"z{DRONE_IDX_MAPPING[idx]}"].values
+                xs = df[f"x{col_idx}"].values
+                ys = df[f"y{col_idx}"].values
+                zs = df[f"z{col_idx}"].values
             except KeyError as exc:
                 raise ValueError(
                     f"{csv_path.name} is missing columns for drone index {idx} "
-                    f"(x{idx}, y{idx}, z{idx})"
+                    f"(x{col_idx}, y{col_idx}, z{col_idx})"
                 ) from exc
 
             waypoints = np.column_stack((xs, ys, zs))
@@ -813,21 +865,22 @@ class Swarm:
         cls,
         csv_path: Path,
         n_drones: int,
+        drone_idx_mapping: dict,
         prepend_points: list | None = None,
     ) -> list:
         waypoints_per_drone = cls._load_phase_waypoints(
-            csv_path, n_drones, prepend_points=prepend_points
+            csv_path, n_drones, drone_idx_mapping, prepend_points=prepend_points
         )
         return [CubicBezierSpline.from_waypoints(wp) for wp in waypoints_per_drone]
 
     @classmethod
-    def _load_phase_splines_reversed(cls, csv_path: Path, n_drones: int) -> list:
-        waypoints_per_drone = cls._load_phase_waypoints(csv_path, n_drones, reverse=True)
+    def _load_phase_splines_reversed(cls, csv_path: Path, n_drones: int, drone_idx_mapping: dict) -> list:
+        waypoints_per_drone = cls._load_phase_waypoints(csv_path, n_drones, drone_idx_mapping, reverse=True)
         return [CubicBezierSpline.from_waypoints(wp) for wp in waypoints_per_drone]
 
     @classmethod
-    def _load_phase_last_points(cls, csv_path: Path, n_drones: int) -> list:
-        waypoints_per_drone = cls._load_phase_waypoints(csv_path, n_drones)
+    def _load_phase_last_points(cls, csv_path: Path, n_drones: int, drone_idx_mapping: dict) -> list:
+        waypoints_per_drone = cls._load_phase_waypoints(csv_path, n_drones, drone_idx_mapping)
         return [wp[-1] for wp in waypoints_per_drone]
 
     @staticmethod
@@ -839,6 +892,8 @@ class Swarm:
         offset: int = 0,
     ) -> tuple[float, int]:
         coeffs = []
+        max_val = -100000
+        # print(segment_duration)
         for bezier in spline.beziers:
             coeffs.append(
                 CompressedSegment(
@@ -847,8 +902,8 @@ class Swarm:
                     y=[bezier.p1[1], bezier.p2[1], bezier.p3[1]],
                     z=[bezier.p1[2], bezier.p2[2], bezier.p3[2]],
                     yaw=[0.0, 0.0, 0.0],
-                )
-            )
+                ))
+        max_val = max(max_val, max(map(abs, bezier.p1)), max(map(abs, bezier.p2)), max(map(abs, bezier.p3)))
 
         bytes_written = await cf.memory().write_compressed_trajectory(
             CompressedStart(
@@ -860,6 +915,10 @@ class Swarm:
             coeffs,
             start_addr=offset,
         )
+        # print(max_val)
+        # print(offset)
+        # print(len(spline.beziers))
+        # print(trajectory_id)
         print(f"Uploaded trajectory {trajectory_id} ({bytes_written} bytes)")
         await cf.high_level_commander().define_trajectory(
             trajectory_id, offset, len(spline.beziers), 1

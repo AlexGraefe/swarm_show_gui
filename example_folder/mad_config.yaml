@@ -1,5 +1,5 @@
-dt_start: 0.05
-dt_show: 0.05
+dt_start: 0.1
+dt_show: 0.1
 num_trials: 1
 wait_after_takeoff: 1.0
 wait_between_passes: 1.0
