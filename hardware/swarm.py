@@ -37,7 +37,7 @@ LANDING_DURATION = 3.0
 GO_TO_START_DURATION = 2.0
 GO_TO_PAD_DURATION = 3.0
 GO_TO_END_DURATION = 1.0
-LOG_INTERVAL = 100  # ms
+LOG_INTERVAL = 500  # ms
 STITCH_POINT_REPEAT = 3
 STAGGER_STRIDE = 5   # launch/land every Nth drone per round (round 0: idx 0,4,8…; round 1: 1,5,9…)
 STAGGER_DELAY  = TAKEOFF_DURATION + 0.5  # seconds between stagger groups
@@ -173,7 +173,9 @@ class Swarm:
             await self._disconnect_all()
 
         self._link_context = LinkContext()
-        uris = [f"{base_address}{index:02X}" for index in range(1, num_drones + 1)]
+        uris = [f"{base_address}{index:02X}" for index in range(1, 1 + num_drones)]
+
+        print(f"Connecting to {num_drones} drone(s) at addresses: {', '.join(uris)}")
 
         try:
             self._connected_cfs = list(
@@ -262,6 +264,7 @@ class Swarm:
         wait_after_takeoff: float = 5.0,
         wait_between_passes: float = 5.0,
         wait_before_landing: float = 5.0,
+        first_frame_colors_csv: Path | None = None,
     ) -> None:
         """Start the full flight sequence: takeoff → show → landing.
 
@@ -283,7 +286,8 @@ class Swarm:
                 self._fly_task = None
         self._fly_task = asyncio.create_task(
             self._fly_impl(takeoff_csv, active_csv, landing_csv, dt_start, dt_show, num_trials,
-                           wait_after_takeoff, wait_between_passes, wait_before_landing)
+                           wait_after_takeoff, wait_between_passes, wait_before_landing,
+                           first_frame_colors_csv)
         )
         self._fly_task.add_done_callback(self._on_fly_task_done)
 
@@ -298,6 +302,7 @@ class Swarm:
         wait_after_takeoff: float = 5.0,
         wait_between_passes: float = 5.0,
         wait_before_landing: float = 5.0,
+        first_frame_colors_csv: Path | None = None,
     ) -> None:
         """Internal coroutine that performs the full flight sequence."""
         if not self._connected_cfs:
@@ -322,7 +327,7 @@ class Swarm:
             print("Applying initial controller parameters...")
             for cf in self._connected_cfs:
                 param = cf.param()
-                param.set("colorLedBot.wrgb8888", 0x000000FF)
+                param.set("colorLedBot.wrgb8888", 0x00000080)
             #     param = cf.param()
             #     param.set("landingCrtl.hOffset", 0.02)
             #     param.set("landingCrtl.hDuration", 1.0)
@@ -338,6 +343,16 @@ class Swarm:
 
             print("Building drone-to-trajectory mapping from pad positions...")
             drone_idx_mapping = self._build_drone_idx_mapping(takeoff_csv, pad_positions)
+
+            print("Applying first-frame LED colors...")
+            first_frame_colors = self._load_first_frame_colors(first_frame_colors_csv)
+            if first_frame_colors is not None:
+                for idx, cf in enumerate(self._connected_cfs):
+                    col_idx = drone_idx_mapping[idx]
+                    if col_idx < len(first_frame_colors):
+                        r, g, b = first_frame_colors[col_idx]
+                        wrgb = (r << 16) | (g << 8) | b
+                        cf.param().set("colorLedBot.wrgb8888", wrgb)
 
             print("Loading trajectory data...")
             takeoff_splines = self._load_phase_splines(takeoff_csv, n_drones, drone_idx_mapping)
@@ -882,6 +897,29 @@ class Swarm:
     def _load_phase_last_points(cls, csv_path: Path, n_drones: int, drone_idx_mapping: dict) -> list:
         waypoints_per_drone = cls._load_phase_waypoints(csv_path, n_drones, drone_idx_mapping)
         return [wp[-1] for wp in waypoints_per_drone]
+
+    @staticmethod
+    def _load_first_frame_colors(colors_csv: Path | None) -> list | None:
+        """Load per-drone RGB colors from *colors_csv*.
+
+        Returns a list of ``(R, G, B)`` tuples indexed by CSV column index, or
+        ``None`` if the path is ``None`` or the file does not exist.
+        """
+        if colors_csv is None or not colors_csv.is_file():
+            print("No first_frame_colors.csv provided, skipping LED color setup.")
+            return None
+        df = pd.read_csv(colors_csv)
+        result = []
+        for _, row in df.iterrows():
+            r = int(row["R"])
+            g = int(row["G"])
+            b = int(row["B"])
+            total = r + g + b or 1
+            r_shifted = int(r) #  * 0.3 / total * 255)
+            g_shifted = int(g) # / total * 255)
+            b_shifted = int(b) # * 0.3 / total * 255)
+            result.append((r_shifted, g_shifted, b_shifted))
+        return result
 
     @staticmethod
     async def _upload_trajectory(

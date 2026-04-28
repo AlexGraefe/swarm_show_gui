@@ -95,7 +95,7 @@ class LeftPanel(QFrame):
         self._dt_start_input.setText(self._last_valid_dt_start)
         self._dt_show_input.setText(self._last_valid_dt_show)
         self._num_trials_input.setText(self._last_valid_num_trials)
-        self._base_address_input.setText("radio://0/75/2M/DB1F1010")
+        self._base_address_input.setText("radio://0/84/2M/D91F7001")
         self._num_drones_input.setText(self._last_valid_num_drones)
         self._wait_after_takeoff_input.setText(self._last_valid_wait_after_takeoff)
         self._wait_between_passes_input.setText(self._last_valid_wait_between_passes)
@@ -515,6 +515,13 @@ class LeftPanel(QFrame):
             return None
 
         return takeoff_csv, active_csv, landing_csv
+
+    def get_first_frame_colors_csv_path(self) -> Path | None:
+        folder = self._folder_input.text().strip()
+        if not folder:
+            return None
+        csv = Path(folder) / "first_frame_colors.csv"
+        return csv if csv.is_file() else None
 
     def get_dt_start_seconds(self) -> float:
         text = self._dt_start_input.text().strip()

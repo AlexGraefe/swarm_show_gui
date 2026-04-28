@@ -77,6 +77,8 @@ class MiddlePanel(QFrame):
 		self._labels = []
 		self._trail_len = POINTS_PER_SEGMENT * 3
 		self._mode = "simulation"
+		self._output_dir: Path | None = None
+		self._show_finished = False
 		self._phase_xi: list[np.ndarray] = []
 		self._phase_yi: list[np.ndarray] = []
 		self._phase_zi: list[np.ndarray] = []
@@ -84,12 +86,43 @@ class MiddlePanel(QFrame):
 		self._phase_start_time: float | None = None
 		self._current_phase_name = ""
 
+		self._drone_colors: list | None = None
+
 		self._show_message("Select a valid folder and click Simulate")
 
-	def start_live_mode(self, n_drones: int) -> None:
+	@staticmethod
+	def _load_drone_colors(csv_path: Path | None) -> list | None:
+		"""Load per-drone RGB colors (0-255) from *csv_path* and return as (r, g, b) 0-1 tuples."""
+		if csv_path is None or not csv_path.is_file():
+			return None
+		try:
+			df = pd.read_csv(csv_path)
+			colors = []
+			for _, row in df.iterrows():
+				r = int(row["R"]) / 255.0
+				g = int(row["G"]) / 255.0
+				b = int(row["B"]) / 255.0
+				# Shift hue towards green by boosting G and reducing R and B.
+				total = r + g + b or 1.0
+				colors.append((r, g, b))
+			return colors
+		except (OSError, KeyError):
+			return None
+
+	def _color(self, n: int) -> tuple:
+		"""Return the color for drone *n*, falling back to tab10 if no CSV colors loaded."""
+		if self._drone_colors is not None and n < len(self._drone_colors):
+			return self._drone_colors[n]
+		return plt.cm.tab10.colors[n % len(plt.cm.tab10.colors)]
+
+	def start_live_mode(self, n_drones: int, first_frame_colors_csv: Path | None = None) -> None:
 		"""Switch panel to live measured-position rendering mode."""
+		self._drone_colors = self._load_drone_colors(first_frame_colors_csv)
 		self._timer.stop()
 		self._mode = "live"
+		self._show_finished = False
+		if self._output_dir is None:
+			self._output_dir = Path.cwd()
 		self._n_drones = n_drones
 		self._all_xi = [np.array([], dtype=float) for _ in range(n_drones)]
 		self._all_yi = [np.array([], dtype=float) for _ in range(n_drones)]
@@ -143,30 +176,30 @@ class MiddlePanel(QFrame):
 		self._fig.clf()
 		self._ax = self._fig.add_subplot(111, projection="3d")
 
-		colors = plt.cm.tab10.colors
 		self._trails = []
 		self._markers = []
 		self._target_markers = []
 		self._labels = []
 
 		for n in range(self._n_drones):
+			color = self._color(n)
 			if n < len(self._phase_xi) and len(self._phase_xi[n]) > 0:
 				self._ax.plot(
 					self._phase_xi[n],
 					self._phase_yi[n],
 					self._phase_zi[n],
-					color=colors[n % len(colors)],
+					color=color,
 					linewidth=0.8,
 					alpha=0.25,
 				)
 
-			trail, = self._ax.plot([], [], [], color=colors[n % len(colors)], linewidth=1.5)
+			trail, = self._ax.plot([], [], [], color=color, linewidth=1.5)
 			marker, = self._ax.plot(
 				[],
 				[],
 				[],
 				"o",
-				color=colors[n % len(colors)],
+				color=color,
 				markersize=8,
 				label=f"Drone {n}",
 			)
@@ -175,14 +208,14 @@ class MiddlePanel(QFrame):
 				[],
 				[],
 				"x",
-				color=colors[n % len(colors)],
+				color=color,
 				markersize=8,
 				markeredgewidth=2.0,
 			)
 			label = self._ax.text(
 				0, 0, 0,
 				str(n),
-				color=colors[n % len(colors)],
+				color=color,
 				fontsize=8,
 				visible=False,
 			)
@@ -273,6 +306,7 @@ class MiddlePanel(QFrame):
 
 	def stop_live_mode(self) -> None:
 		"""Leave live mode and keep current view until next simulation starts."""
+		self._write_final_csv()
 		self._mode = "simulation"
 		self._phase_start_time = None
 
@@ -287,9 +321,13 @@ class MiddlePanel(QFrame):
 		wait_after_takeoff: float = HOVER_SECONDS,
 		wait_between_passes: float = HOVER_SECONDS,
 		wait_before_landing: float = HOVER_SECONDS,
+		first_frame_colors_csv: Path | None = None,
 	) -> bool:
 		"""Load all phase CSVs and (re)start the full show animation."""
+		self._drone_colors = self._load_drone_colors(first_frame_colors_csv)
 		self._mode = "simulation"
+		self._output_dir = takeoff_csv_path.parent
+		self._show_finished = False
 		self._timer.stop()
 
 		full_show = self._build_full_show_data(
@@ -601,34 +639,34 @@ class MiddlePanel(QFrame):
 		self._fig.clf()
 		self._ax = self._fig.add_subplot(111, projection="3d")
 
-		colors = plt.cm.tab10.colors
 		self._trails = []
 		self._markers = []
 		self._labels = []
 
 		for n in range(self._n_drones):
+			color = self._color(n)
 			self._ax.plot(
 				self._all_xi[n],
 				self._all_yi[n],
 				self._all_zi[n],
-				color=colors[n % len(colors)],
+				color=color,
 				linewidth=0.8,
 				alpha=0.25,
 			)
-			trail, = self._ax.plot([], [], [], color=colors[n % len(colors)], linewidth=1.5)
+			trail, = self._ax.plot([], [], [], color=color, linewidth=1.5)
 			marker, = self._ax.plot(
 				[],
 				[],
 				[],
 				"o",
-				color=colors[n % len(colors)],
+				color=color,
 				markersize=8,
 				label=f"Drone {n}",
 			)
 			label = self._ax.text(
 				0, 0, 0,
 				str(n),
-				color=colors[n % len(colors)],
+				color=color,
 				fontsize=8,
 				visible=False,
 			)
@@ -686,7 +724,48 @@ class MiddlePanel(QFrame):
 		self._last_rendered_frame = frame
 		self._frame_idx = frame
 		if frame >= self._n_frames - 1:
+			self._write_final_csv()
 			self._timer.stop()
+
+	def _write_final_csv(self) -> None:
+		"""Write a CSV with each drone's final position and planned position."""
+		if self._show_finished or self._n_drones == 0:
+			return
+		self._show_finished = True
+
+		from datetime import datetime
+		timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+		out_dir = self._output_dir if self._output_dir is not None else Path.cwd()
+		out_path = out_dir / f"show_results_{timestamp}.csv"
+
+		row: dict[str, float] = {}
+		for n in range(self._n_drones):
+			if n < len(self._all_xi) and len(self._all_xi[n]) > 0:
+				ax = float(self._all_xi[n][-1])
+				ay = float(self._all_yi[n][-1])
+				az = float(self._all_zi[n][-1])
+			else:
+				ax, ay, az = float("nan"), float("nan"), float("nan")
+
+			if self._mode == "live" and n < len(self._phase_xi) and len(self._phase_xi[n]) > 0:
+				tx = float(self._phase_xi[n][-1])
+				ty = float(self._phase_yi[n][-1])
+				tz = float(self._phase_zi[n][-1])
+			else:
+				tx, ty, tz = ax, ay, az
+
+			row[f"actual_x_{n}"] = ax
+			row[f"actual_y_{n}"] = ay
+			row[f"actual_z_{n}"] = az
+			row[f"target_x_{n}"] = tx
+			row[f"target_y_{n}"] = ty
+			row[f"target_z_{n}"] = tz
+
+		try:
+			pd.DataFrame([row]).to_csv(out_path, index=False)
+			print(f"[Results] Show results saved to {out_path}")
+		except OSError as e:
+			print(f"[Results] Failed to save CSV: {e}")
 
 	def _show_message(self, message: str) -> None:
 		self._timer.stop()

@@ -160,6 +160,7 @@ class MainWindow(QMainWindow):
         wait_after_takeoff = self.panel_left.get_wait_after_takeoff_seconds()
         wait_between_passes = self.panel_left.get_wait_between_passes_seconds()
         wait_before_landing = self.panel_left.get_wait_before_landing_seconds()
+        first_frame_colors_csv = self.panel_left.get_first_frame_colors_csv_path()
         started = self.panel_center.start_simulation(
             takeoff_csv_path,
             active_csv_path,
@@ -170,6 +171,7 @@ class MainWindow(QMainWindow):
             wait_after_takeoff,
             wait_between_passes,
             wait_before_landing,
+            first_frame_colors_csv,
         )
         if not started:
             return
@@ -208,9 +210,11 @@ class MainWindow(QMainWindow):
         wait_after_takeoff = self.panel_left.get_wait_after_takeoff_seconds()
         wait_between_passes = self.panel_left.get_wait_between_passes_seconds()
         wait_before_landing = self.panel_left.get_wait_before_landing_seconds()
+        first_frame_colors_csv = self.panel_left.get_first_frame_colors_csv_path()
 
         self._swarm.fly(takeoff_csv, active_csv, landing_csv, dt_start, dt_show, num_trials,
-                        wait_after_takeoff, wait_between_passes, wait_before_landing)
+                        wait_after_takeoff, wait_between_passes, wait_before_landing,
+                        first_frame_colors_csv)
 
     async def _connect_drones(self, base_address: str, num_drones: int) -> None:
         await self._sm.transition(AppState.CONNECTING)
@@ -251,7 +255,8 @@ class MainWindow(QMainWindow):
         self.panel_center.update_live_positions(positions)
 
     def on_live_mode_started(self, n_drones: int) -> None:
-        self.panel_center.start_live_mode(n_drones)
+        first_frame_colors_csv = self.panel_left.get_first_frame_colors_csv_path()
+        self.panel_center.start_live_mode(n_drones, first_frame_colors_csv)
 
     def on_live_mode_stopped(self) -> None:
         self.panel_center.stop_live_mode()
