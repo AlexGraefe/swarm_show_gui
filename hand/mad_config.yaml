@@ -1,0 +1,6 @@
+dt_start: 0.1
+dt_show: 0.1
+num_trials: 3
+wait_after_takeoff: 5.0
+wait_between_passes: 1.0
+wait_before_landing: 1.0

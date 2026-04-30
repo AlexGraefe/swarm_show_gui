@@ -37,9 +37,9 @@ LANDING_DURATION = 3.0
 GO_TO_START_DURATION = 2.0
 GO_TO_PAD_DURATION = 3.0
 GO_TO_END_DURATION = 1.0
-LOG_INTERVAL = 500  # ms
+LOG_INTERVAL = 50  # ms
 STITCH_POINT_REPEAT = 3
-STAGGER_STRIDE = 5   # launch/land every Nth drone per round (round 0: idx 0,4,8…; round 1: 1,5,9…)
+STAGGER_STRIDE = 1   # launch/land every Nth drone per round (round 0: idx 0,4,8…; round 1: 1,5,9…)
 STAGGER_DELAY  = TAKEOFF_DURATION + 0.5  # seconds between stagger groups
 CSV_LOAD_STRIDE = 2
 
@@ -138,6 +138,7 @@ class Swarm:
         self._link_context: object | None = None
         self._live_log_streams: list[object] = []
         self._latest_positions: list[dict[str, Any]] = []
+        self._live_fetch_tasks: list[asyncio.Task] = []
         self._connect_task: asyncio.Task | None = None
         self._fly_task: asyncio.Task | None = None
 
@@ -562,26 +563,15 @@ class Swarm:
                 param = cf.param()
                 param.set("landingCrtl.hOffset", 0.02)
                 param.set("landingCrtl.hDuration", 1.0)
-                param.set("colorLedBot.wrgb8888", 0x00000000)
+                # param.set("colorLedBot.wrgb8888", 0x00000000)
             #     param.set("ctrlMel.ki_z", 1.5)
                 param.set("stabilizer.controller", 2)
             await self._sleep_with_live_updates(2.5)
 
             print("Landing...")
             self._set_state(SwarmState.LANDED)
-            stagger_groups = self._stagger_groups(n_drones)
-            for group_idx, group in enumerate(stagger_groups):
-                await asyncio.gather(
-                    *[
-                        self._connected_cfs[i].high_level_commander().land(
-                            pad_positions[i][2], None, LANDING_DURATION, None
-                        )
-                        for i in group
-                    ]
-                )
-                await self._sleep_with_live_updates(LANDING_DURATION + 0.5)
+            await self._land_with_retry(pad_positions, max_retries=3)
             needs_landing = False
-            # await self._sleep_with_live_updates(2.5)
 
             await asyncio.gather(
                 *[cf.high_level_commander().stop(None) for cf in self._connected_cfs]
@@ -606,6 +596,9 @@ class Swarm:
                 )
             await self._stop_live_position_logging()
             self._gui.on_live_mode_stopped()
+            for cf in self._connected_cfs:
+                param = cf.param()
+                param.set("colorLedBot.wrgb8888", 0x00000000)
             if self._connected_cfs:
                 self._gui.on_fly_enabled(True)
 
@@ -655,11 +648,49 @@ class Swarm:
         finally:
             await log_stream.stop()
 
+    @staticmethod
+    async def _read_pm_state_and_position(
+        cf: object,
+    ) -> tuple[int, float, float, float]:
+        """Read ``pm.state`` and position estimate from *cf*.
+
+        Returns ``(pm_state, x, y, z)``.
+        """
+        log = cf.log()
+        block = await log.create_block()
+        await block.add_variable("pm.state")
+        await block.add_variable("stateEstimate.x")
+        await block.add_variable("stateEstimate.y")
+        await block.add_variable("stateEstimate.z")
+        log_stream = await block.start(LOG_INTERVAL)
+        try:
+            values = (await asyncio.wait_for(log_stream.next(), timeout=5.0)).data
+            return (
+                int(values["pm.state"]),
+                float(values["stateEstimate.x"]),
+                float(values["stateEstimate.y"]),
+                float(values["stateEstimate.z"]),
+            )
+        finally:
+            await log_stream.stop()
+
+    async def _live_fetch_loop(self, stream: object, idx: int) -> None:
+        """Background task: continuously read from *stream* and cache the latest data."""
+        try:
+            while True:
+                sample = await stream.next()
+                self._latest_positions[idx]["data"] = sample.data
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
     async def _start_live_position_logging(self) -> None:
         self._latest_positions = [{"data": None} for _ in self._connected_cfs]
         self._live_log_streams = []
+        self._live_fetch_tasks = []
 
-        for cf in self._connected_cfs:
+        for idx, cf in enumerate(self._connected_cfs):
             log = cf.log()
             block = await log.create_block()
             await block.add_variable("stateEstimate.x")
@@ -667,8 +698,16 @@ class Swarm:
             await block.add_variable("stateEstimate.z")
             log_stream = await block.start(LOG_INTERVAL)
             self._live_log_streams.append(log_stream)
+            task = asyncio.create_task(self._live_fetch_loop(log_stream, idx))
+            self._live_fetch_tasks.append(task)
 
     async def _stop_live_position_logging(self) -> None:
+        for task in self._live_fetch_tasks:
+            task.cancel()
+        if self._live_fetch_tasks:
+            await asyncio.gather(*self._live_fetch_tasks, return_exceptions=True)
+        self._live_fetch_tasks = []
+
         for stream in self._live_log_streams:
             stop = getattr(stream, "stop", None)
             if callable(stop):
@@ -678,22 +717,10 @@ class Swarm:
         self._live_log_streams = []
         self._latest_positions = []
 
-    async def _poll_live_positions_once(self, max_wait: float = 0.12) -> None:
-        if not self._live_log_streams:
+    def _poll_live_positions_once(self) -> None:
+        """Read the latest cached positions and push them to the GUI."""
+        if not self._latest_positions:
             return
-
-        samples = await asyncio.gather(
-            *[
-                asyncio.wait_for(stream.next(), timeout=max_wait)
-                for stream in self._live_log_streams
-            ],
-            return_exceptions=True,
-        )
-
-        for idx, sample in enumerate(samples):
-            if isinstance(sample, Exception):
-                continue
-            self._latest_positions[idx]["data"] = sample.data
 
         positions: list[tuple[float, float, float] | None] = []
         for last in self._latest_positions:
@@ -721,10 +748,131 @@ class Swarm:
             if remaining <= 0:
                 break
             step = min(0.12, remaining)
-            if self._live_log_streams:
-                await self._poll_live_positions_once(max_wait=step)
-            else:
-                await asyncio.sleep(step)
+            await asyncio.sleep(step)
+            self._poll_live_positions_once()
+
+    async def _land_with_retry(
+        self,
+        pad_positions: list,
+        max_retries: int = 3,
+        max_pad_distance: float = 0.3,
+    ) -> None:
+        """Land all connected drones with up to *max_retries* retry attempts.
+
+        After each landing, reads ``pm.state`` for every still-active drone.
+        Drones with ``pm.state != 1`` that are within *max_pad_distance* of
+        their pad are taken back up to 1 m, given fresh controller parameters,
+        and landed again.
+        """
+        active = list(range(len(self._connected_cfs)))
+
+        for attempt in range(1 + max_retries):
+            if not active:
+                break
+
+            print(
+                f"Landing attempt {attempt + 1}/{1 + max_retries} "
+                f"for drone(s): {[i + 1 for i in active]}..."
+            )
+            await asyncio.gather(
+                *[
+                    self._connected_cfs[i].high_level_commander().land(
+                        pad_positions[i][2], None, LANDING_DURATION, None
+                    )
+                    for i in active
+                ]
+            )
+            await self._sleep_with_live_updates(LANDING_DURATION + 0.5)
+
+            # Read pm.state + position for every active drone.
+            results = await asyncio.gather(
+                *[
+                    self._read_pm_state_and_position(self._connected_cfs[i])
+                    for i in active
+                ],
+                return_exceptions=True,
+            )
+
+            if attempt == max_retries:
+                # Final attempt — just log outcomes, no more retries.
+                for drone_idx, result in zip(active, results):
+                    if isinstance(result, Exception):
+                        print(f"Drone {drone_idx + 1}: could not read pm.state: {result}")
+                    else:
+                        pm_state, x, y, z = result
+                        print(
+                            f"Drone {drone_idx + 1}: final pm.state={pm_state}, "
+                            f"pos=({x:.3f}, {y:.3f}, {z:.3f})"
+                        )
+                break
+
+            retry = []
+            for drone_idx, result in zip(active, results):
+                if isinstance(result, Exception):
+                    print(f"Drone {drone_idx + 1}: could not read pm.state: {result}")
+                    continue
+                pm_state, x, y, z = result
+                pad_x, pad_y = pad_positions[drone_idx][0], pad_positions[drone_idx][1]
+                dist = ((x - pad_x) ** 2 + (y - pad_y) ** 2) ** 0.5
+                print(
+                    f"Drone {drone_idx + 1}: pm.state={pm_state}, "
+                    f"pos=({x:.3f}, {y:.3f}, {z:.3f}), dist_to_pad={dist:.3f} m"
+                )
+                if pm_state == 1:
+                    print(f"Drone {drone_idx + 1}: landed successfully.")
+                elif dist > max_pad_distance:
+                    print(
+                        f"Drone {drone_idx + 1}: pm.state={pm_state} but {dist:.3f} m "
+                        f"from pad (>{max_pad_distance} m) — skipping retry."
+                    )
+                else:
+                    print(f"Drone {drone_idx + 1}: pm.state={pm_state} — scheduling retry.")
+                    retry.append(drone_idx)
+
+            if not retry:
+                print("All active drones landed successfully (or no eligible retries).")
+                break
+
+            print(f"Retrying landing for drone(s): {[i + 1 for i in retry]}...")
+
+            # Take retry drones back up to 1 m.
+            await asyncio.gather(
+                *[
+                    self._connected_cfs[i].high_level_commander().take_off(
+                        1.0, None, TAKEOFF_DURATION, None
+                    )
+                    for i in retry
+                ]
+            )
+            await self._sleep_with_live_updates(TAKEOFF_DURATION + 1.0)
+
+            # Position above pad.
+            await asyncio.gather(
+                *[
+                    self._connected_cfs[i].high_level_commander().go_to(
+                        pad_positions[i][0],
+                        pad_positions[i][1],
+                        pad_positions[i][2] + 1.0,
+                        0.0,
+                        GO_TO_PAD_DURATION,
+                        relative=False,
+                        linear=False,
+                        group_mask=None,
+                    )
+                    for i in retry
+                ]
+            )
+            await self._sleep_with_live_updates(GO_TO_PAD_DURATION + 0.5)
+
+            # Re-apply pre-landing controller parameters.
+            for i in retry:
+                param = self._connected_cfs[i].param()
+                param.set("landingCrtl.hOffset", 0.02)
+                param.set("landingCrtl.hDuration", 1.0)
+                param.set("stabilizer.controller", 2)
+            await self._sleep_with_live_updates(2.5)
+
+            active = retry
 
     # -- CSV / spline helpers ------------------------------------------------
 

@@ -17,6 +17,7 @@ from bezier.bezier import CubicBezierSpline
 
 DEFAULT_SEGMENT_DURATION = 0.1
 POINTS_PER_SEGMENT = 10
+LIVE_PLOT_ENABLED = False
 HOVER_SECONDS = 5.0
 STITCH_POINT_REPEAT = 10
 TESTBED_X_MIN = -4.0
@@ -85,8 +86,9 @@ class MiddlePanel(QFrame):
 		self._phase_durations: list[float] = []
 		self._phase_start_time: float | None = None
 		self._current_phase_name = ""
-
-		self._drone_colors: list | None = None
+		self._target_xi_log: list[np.ndarray] = []
+		self._target_yi_log: list[np.ndarray] = []
+		self._target_zi_log: list[np.ndarray] = []
 
 		self._show_message("Select a valid folder and click Simulate")
 
@@ -133,6 +135,9 @@ class MiddlePanel(QFrame):
 		self._phase_durations = []
 		self._phase_start_time = None
 		self._current_phase_name = ""
+		self._target_xi_log = [np.array([], dtype=float) for _ in range(n_drones)]
+		self._target_yi_log = [np.array([], dtype=float) for _ in range(n_drones)]
+		self._target_zi_log = [np.array([], dtype=float) for _ in range(n_drones)]
 		self._redraw_live_scene()
 
 	def set_live_phase_curves(
@@ -173,6 +178,8 @@ class MiddlePanel(QFrame):
 
 	def _redraw_live_scene(self) -> None:
 		"""Rebuild live scene preserving measured trail data and current phase curve."""
+		if not LIVE_PLOT_ENABLED:
+			return
 		self._fig.clf()
 		self._ax = self._fig.add_subplot(111, projection="3d")
 
@@ -266,6 +273,11 @@ class MiddlePanel(QFrame):
 			return
 
 		n_drones = min(self._n_drones, len(positions))
+		elapsed = (
+			max(0.0, time.perf_counter() - self._phase_start_time)
+			if self._phase_start_time is not None
+			else None
+		)
 		for idx in range(n_drones):
 			pos = positions[idx]
 			if pos is None:
@@ -276,19 +288,36 @@ class MiddlePanel(QFrame):
 			self._all_yi[idx] = np.append(self._all_yi[idx], y)
 			self._all_zi[idx] = np.append(self._all_zi[idx], z)
 
-			start = max(0, len(self._all_xi[idx]) - self._trail_len)
-			self._trails[idx].set_data_3d(
-				self._all_xi[idx][start:],
-				self._all_yi[idx][start:],
-				self._all_zi[idx][start:],
-			)
-			self._markers[idx].set_data_3d([x], [y], [z])
-			self._labels[idx].set_position((x, y))
-			self._labels[idx].set_3d_properties(z + 0.1, zdir="z")
-			self._labels[idx].set_visible(True)
+			if (
+				elapsed is not None
+				and idx < len(self._phase_xi)
+				and len(self._phase_xi[idx]) > 0
+				and idx < len(self._phase_durations)
+			):
+				duration = max(self._phase_durations[idx], 1e-6)
+				progress = min(1.0, elapsed / duration)
+				frame_idx = int(round(progress * (len(self._phase_xi[idx]) - 1)))
+				self._target_xi_log[idx] = np.append(self._target_xi_log[idx], self._phase_xi[idx][frame_idx])
+				self._target_yi_log[idx] = np.append(self._target_yi_log[idx], self._phase_yi[idx][frame_idx])
+				self._target_zi_log[idx] = np.append(self._target_zi_log[idx], self._phase_zi[idx][frame_idx])
+			else:
+				self._target_xi_log[idx] = np.append(self._target_xi_log[idx], float("nan"))
+				self._target_yi_log[idx] = np.append(self._target_yi_log[idx], float("nan"))
+				self._target_zi_log[idx] = np.append(self._target_zi_log[idx], float("nan"))
 
-		if self._phase_start_time is not None:
-			elapsed = max(0.0, time.perf_counter() - self._phase_start_time)
+			if LIVE_PLOT_ENABLED:
+				start = max(0, len(self._all_xi[idx]) - self._trail_len)
+				self._trails[idx].set_data_3d(
+					self._all_xi[idx][start:],
+					self._all_yi[idx][start:],
+					self._all_zi[idx][start:],
+				)
+				self._markers[idx].set_data_3d([x], [y], [z])
+				self._labels[idx].set_position((x, y))
+				self._labels[idx].set_3d_properties(z + 0.1, zdir="z")
+				self._labels[idx].set_visible(True)
+
+		if LIVE_PLOT_ENABLED and elapsed is not None:
 			for idx in range(min(n_drones, len(self._target_markers), len(self._phase_xi), len(self._phase_durations))):
 				if len(self._phase_xi[idx]) == 0:
 					continue
@@ -302,7 +331,8 @@ class MiddlePanel(QFrame):
 					[self._phase_zi[idx][frame_idx]],
 				)
 
-		self._canvas.draw_idle()
+		if LIVE_PLOT_ENABLED:
+			self._canvas.draw_idle()
 
 	def stop_live_mode(self) -> None:
 		"""Leave live mode and keep current view until next simulation starts."""
@@ -728,7 +758,7 @@ class MiddlePanel(QFrame):
 			self._timer.stop()
 
 	def _write_final_csv(self) -> None:
-		"""Write a CSV with each drone's final position and planned position."""
+		"""Write a CSV with each drone's full recorded trajectory."""
 		if self._show_finished or self._n_drones == 0:
 			return
 		self._show_finished = True
@@ -738,31 +768,48 @@ class MiddlePanel(QFrame):
 		out_dir = self._output_dir if self._output_dir is not None else Path.cwd()
 		out_path = out_dir / f"show_results_{timestamp}.csv"
 
-		row: dict[str, float] = {}
+		n_actual = max(
+			(len(self._all_xi[n]) for n in range(self._n_drones) if n < len(self._all_xi)),
+			default=0,
+		)
+		n_target = max(
+			(len(self._target_xi_log[n]) for n in range(self._n_drones) if n < len(self._target_xi_log)),
+			default=0,
+		) if self._mode == "live" else 0
+		n_points = max(n_actual, n_target)
+		if n_points == 0:
+			return
+
+		data: dict[str, list] = {}
 		for n in range(self._n_drones):
 			if n < len(self._all_xi) and len(self._all_xi[n]) > 0:
-				ax = float(self._all_xi[n][-1])
-				ay = float(self._all_yi[n][-1])
-				az = float(self._all_zi[n][-1])
+				xs = self._all_xi[n]
+				ys = self._all_yi[n]
+				zs = self._all_zi[n]
+				pad = n_points - len(xs)
+				data[f"actual_x_{n}"] = list(xs) + [float("nan")] * pad
+				data[f"actual_y_{n}"] = list(ys) + [float("nan")] * pad
+				data[f"actual_z_{n}"] = list(zs) + [float("nan")] * pad
 			else:
-				ax, ay, az = float("nan"), float("nan"), float("nan")
+				data[f"actual_x_{n}"] = [float("nan")] * n_points
+				data[f"actual_y_{n}"] = [float("nan")] * n_points
+				data[f"actual_z_{n}"] = [float("nan")] * n_points
 
-			if self._mode == "live" and n < len(self._phase_xi) and len(self._phase_xi[n]) > 0:
-				tx = float(self._phase_xi[n][-1])
-				ty = float(self._phase_yi[n][-1])
-				tz = float(self._phase_zi[n][-1])
-			else:
-				tx, ty, tz = ax, ay, az
-
-			row[f"actual_x_{n}"] = ax
-			row[f"actual_y_{n}"] = ay
-			row[f"actual_z_{n}"] = az
-			row[f"target_x_{n}"] = tx
-			row[f"target_y_{n}"] = ty
-			row[f"target_z_{n}"] = tz
+			if self._mode == "live" and n < len(self._target_xi_log) and len(self._target_xi_log[n]) > 0:
+				txs = self._target_xi_log[n]
+				tys = self._target_yi_log[n]
+				tzs = self._target_zi_log[n]
+				pad = n_points - len(txs)
+				data[f"target_x_{n}"] = list(txs) + [float("nan")] * pad
+				data[f"target_y_{n}"] = list(tys) + [float("nan")] * pad
+				data[f"target_z_{n}"] = list(tzs) + [float("nan")] * pad
+			elif self._mode == "live":
+				data[f"target_x_{n}"] = [float("nan")] * n_points
+				data[f"target_y_{n}"] = [float("nan")] * n_points
+				data[f"target_z_{n}"] = [float("nan")] * n_points
 
 		try:
-			pd.DataFrame([row]).to_csv(out_path, index=False)
+			pd.DataFrame(data).to_csv(out_path, index=False)
 			print(f"[Results] Show results saved to {out_path}")
 		except OSError as e:
 			print(f"[Results] Failed to save CSV: {e}")
